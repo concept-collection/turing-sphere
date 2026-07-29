@@ -94,7 +94,8 @@ let seed = 1;
 let running = false;
 let adapterName = '';
 let pumping = false;
-let stepMs = 0;
+let solverMs = 0;
+let frameMs = 0;
 let generation = 0; // bumped on every rebuild to cancel stale pumps
 
 const source = (): string => editedSource ?? model.source;
@@ -238,7 +239,8 @@ async function rebuild(): Promise<void> {
   disposeView();
   session?.destroy();
   session = null;
-  stepMs = 0;
+  solverMs = 0;
+  frameMs = 0;
   elErr.textContent = '';
   updateCommand();
   if (!device) return;
@@ -381,10 +383,17 @@ function updateStats(): void {
   if (!session) return;
   const { nlat, nphi } = session.cfg;
   const kind = `WebGPU fp32${adapterName ? ` — ${adapterName}` : ''}`;
-  const rate = stepMs > 0 ? `${(1000 / stepMs).toFixed(1)} steps/s` : '—';
+  const solver =
+    solverMs > 0
+      ? `<b>${solverMs.toFixed(2)} ms/step</b> (${(1000 / solverMs).toFixed(0)} steps/s)`
+      : '—';
+  const frame =
+    frameMs > 0
+      ? `${frameMs.toFixed(1)} ms/frame incl. readback + render`
+      : '—';
   elStats.innerHTML =
     `<b>${kind}</b> · grid ${nlat}×${nphi} · nlm ${session.sht.nlm.toLocaleString()} · ` +
-    `${stepMs > 0 ? stepMs.toFixed(1) : '—'} ms/step · ${rate} · ` +
+    `${session.sht.fourierMode.toUpperCase()} · solver ${solver} · ${frame} · ` +
     `t = <b>${session.t.toFixed(2)}</b> (${session.steps} steps)`;
 }
 
@@ -397,14 +406,23 @@ async function pump(): Promise<void> {
   const gen = generation;
   try {
     while (running && session && gen === generation) {
+      // Two separate costs, kept separate. The solver is the batch of steps
+      // alone, waited for but not read back — the number the desktop benchmark
+      // reports, and the only one comparable to it. The frame additionally
+      // carries a GPU->CPU readback per species (which in a browser crosses a
+      // process boundary), the colormapping, and the three.js upload, and those
+      // can easily cost more than the steps do.
       const t0 = performance.now();
       session.step(STEPS_PER_FRAME);
-      // draw() awaits the readback, which also waits for the batch to finish,
-      // so this measures the real end-to-end cost per step.
+      await session.sync();
+      if (gen !== generation) break;
+      const tSolver = performance.now();
       await draw();
       if (gen !== generation) break;
-      const dtMs = (performance.now() - t0) / STEPS_PER_FRAME;
-      stepMs = stepMs === 0 ? dtMs : stepMs + 0.05 * (dtMs - stepMs);
+      const ema = (prev: number, next: number): number =>
+        prev === 0 ? next : prev + 0.05 * (next - prev);
+      solverMs = ema(solverMs, (tSolver - t0) / STEPS_PER_FRAME);
+      frameMs = ema(frameMs, performance.now() - t0);
       updateStats();
       await nextFrame();
     }

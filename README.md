@@ -196,15 +196,57 @@ flags: `--steps`, `--warmup`, `--batch`, `--json`, `--help`;
 `DAWN_FLAGS='backend=vulkan'` (`;`-separated) passes Dawn options through, e.g. to
 pick a backend or to compare against Dawn's own software adapter.
 
-What the comparison does and does not control for:
+### Comparing the two honestly
 
-- the benchmark is **solver only**; the app's `ms/step` includes the per-frame
-  readback amortized over its step batch. For a browser number with no rendering,
-  open `test.html?soak=2000&lmax=63`.
-- the browser adds its own GPU-process boundary and, for a page that is not
-  cross-origin isolated, coarser timers.
+The app reports **two** numbers, and only the first is comparable to the
+benchmark:
+
+```
+solver 0.58 ms/step (1724 steps/s) · 12.4 ms/frame incl. readback + render
+```
+
+`solver` is the batch of steps alone, waited for but not read back — the same
+thing the benchmark's throughput number measures. `ms/frame` additionally carries
+a GPU→CPU readback **per species**, the colormapping, and the vertex upload.
+
+Those per-frame costs are fixed: they do not shrink when the GPU gets faster. So
+the faster your GPU, the larger the ratio between them — on a quick discrete GPU
+it is easy for a frame to cost ten times the four steps inside it, purely because
+a `mapAsync` round trip in a browser has to drain the queue and cross into the GPU
+process. **That is expected, and it is not the solver being slower in the
+browser.** Compare `solver` with the benchmark's throughput line; comparing
+`ms/frame` against it measures the readback, not the computation.
+
+Other things the comparison does not control for:
+
+- the browser's renderer→GPU-process boundary on every submit, where Dawn in Node
+  is in-process; and, for a page that is not cross-origin isolated, coarser
+  `performance.now()`.
 - both sides are fp32 throughout, on the same generated kernels, so nothing here
   is a numerics comparison — only a cost one.
+
+### Is it really the same computation?
+
+```
+node scripts/compare-env.mjs [--lmax 31] [--steps 200] [--preset schnak-spots]
+```
+
+runs one identical spec on the desktop and in a real browser and compares the
+final spectral state. The pipeline is deterministic given (model source,
+parameters, lmax, seed, steps) — a seeded PRNG, then fixed arithmetic — so the two
+should agree to fp32 round-off. Both sides build their spec through the same
+`parseArgs`, so neither can quietly use a different default.
+
+They will *not* agree bit for bit; GPUs differ in fused-multiply-add and other
+latitude fp32 allows. Between Intel Xe (via Dawn) and SwiftShader — about as
+different as two implementations get — 200 steps at lmax 31 agree to a relative
+L2 of **2e-6**.
+
+It also reports which **Fourier stage** each side chose. `ShtPlan` picks FFT or
+DFT from the device's workgroup-storage and invocation limits, and those are
+genuinely different algorithms that round differently, so a mismatch there
+explains a difference in the values rather than being a symptom of one. The app's
+stats line and the benchmark both print the chosen stage for the same reason.
 
 ## Tests
 
@@ -263,6 +305,9 @@ Other commands:
   demo after a number of steps.
 - `node scripts/check-live.mjs [url]` — smoke-check a deployed URL in a real
   browser: load, press Run, confirm the solver advances.
+- `node scripts/compare-env.mjs` — run one identical spec on the desktop and in a
+  browser and compare the final state (see
+  [Is it really the same computation?](#is-it-really-the-same-computation)).
 - `test.html?soak=<steps>&lmax=<n>` — solver-only soak with no rendering.
 
 ### A note on canvas resizing

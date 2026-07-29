@@ -31,7 +31,9 @@ import {
   DEFAULT_WARMUP,
   type RunSpec,
 } from '../src/bench/runSpec.ts';
+import { digestOf, formatDigest } from '../src/mgpu/digest.ts';
 import { installWebGpu, errMsg, NO_ADAPTER_HINT } from './nodeWebGpu.ts';
+import { writeFileSync } from 'node:fs';
 
 const USAGE = `usage: ${BENCH_COMMAND} [options]
 
@@ -42,6 +44,10 @@ const USAGE = `usage: ${BENCH_COMMAND} [options]
   --warmup <n>      untimed steps first (default ${DEFAULT_WARMUP})
   --seed <n>        initial-noise seed (default ${DEFAULT_SEED})
   --batch <n>       steps per submit for the throughput number (default 16)
+  --digest          after timing, re-run exactly --steps steps from the seed and
+                      print a digest of the final state
+  --dump-state <f>  like --digest, and write the state to <f> as JSON, for
+                      scripts/compare-env.mjs to compare against a browser run
   --<param> <v>     any parameter of the preset's model, e.g. --dt 0.05
   --json            machine-readable output
   --help
@@ -62,18 +68,33 @@ if (argv.includes('--help') || argv.includes('-h')) {
 }
 const wantJson = argv.includes('--json');
 let batch = 16;
+let dumpState: string | null = null;
+let wantDigest = false;
 const rest: string[] = [];
 for (let i = 0; i < argv.length; i++) {
-  if (argv[i] === '--json') continue;
-  if (argv[i] === '--batch') {
-    batch = Number(argv[++i]);
+  const a = argv[i];
+  if (a === '--json') continue;
+  if (a === '--digest') {
+    wantDigest = true;
     continue;
   }
-  if (argv[i].startsWith('--batch=')) {
-    batch = Number(argv[i].slice('--batch='.length));
+  const valued = (name: string): string | null => {
+    if (a === `--${name}`) return argv[++i];
+    if (a.startsWith(`--${name}=`)) return a.slice(name.length + 3);
+    return null;
+  };
+  const b = valued('batch');
+  if (b !== null) {
+    batch = Number(b);
     continue;
   }
-  rest.push(argv[i]);
+  const d = valued('dump-state');
+  if (d !== null) {
+    dumpState = d;
+    wantDigest = true;
+    continue;
+  }
+  rest.push(a);
 }
 if (!Number.isInteger(batch) || batch < 1) fail(`--batch must be an integer >= 1`, 2);
 
@@ -159,6 +180,7 @@ try {
       `  grid      lmax ${cfg.lmax} · ${cfg.nlat}×${cfg.nphi} · nlm ${session.sht.nlm.toLocaleString()}`,
     );
     console.log(`  compiled  ${plan.step.length} GPU ops/step (${kernels} generated kernels)`);
+    console.log(`  fourier   ${session.sht.fourierMode.toUpperCase()} stage`);
     console.log(`  backend   WebGPU fp32${adapter ? ` — ${adapter}` : ''}\n            ${runtime}`);
     console.log(`  run       ${spec.warmup} warmup + ${spec.steps} timed steps, seed ${spec.seed}\n`);
   }
@@ -206,6 +228,19 @@ try {
   let finite = true;
   for (const v of field) if (!Number.isFinite(v)) finite = false;
 
+  // A reproducible state to compare across machines: exactly `--steps` steps
+  // from the seed, separate from the timed runs above (which step a different
+  // number of times to measure throughput and latency).
+  let digest = null;
+  let state: Float32Array | null = null;
+  if (wantDigest) {
+    session.seed(spec.seed);
+    session.step(spec.steps);
+    await done();
+    state = await session.read(model.state[0]);
+    digest = digestOf(state, session.sht.fourierMode, adapter);
+  }
+
   if (wantJson) {
     console.log(
       JSON.stringify(
@@ -216,6 +251,7 @@ try {
           backend: { adapter, runtime },
           grid: { lmax: cfg.lmax, nlat: cfg.nlat, nphi: cfg.nphi, nlm: session.sht.nlm },
           compiled: { opsPerStep: plan.step.length, kernels },
+          digest,
           throughput: { batch, msPerStep: throughputMs, stepsPerSec: 1000 / throughputMs },
           latency: t,
           state: {
@@ -247,10 +283,23 @@ try {
         `${model.species[0]} ∈ [${range.min.toFixed(4)}, ${range.max.toFixed(4)}] ` +
         `(contrast ${(range.max - range.min).toFixed(4)})${finite ? '' : '  — NOT FINITE'}`,
     );
+    if (digest) {
+      console.log(`\n  state after ${spec.steps} steps from seed ${spec.seed}:`);
+      console.log(`    ${formatDigest(digest)}`);
+    }
     console.log(
-      `\n  Compare with the ms/step in the app's stats line: same .m, same kernels,\n` +
-        `  but measured while the page renders the spheres.`,
+      `\n  The app's stats line reports the same solver number (batched steps,\n` +
+        `  nothing read back) plus a separate ms/frame that carries the readback\n` +
+        `  and the rendering. Compare solver with solver.`,
     );
+  }
+
+  if (dumpState && state && digest) {
+    writeFileSync(
+      dumpState,
+      JSON.stringify({ command: formatCommand(spec), spec, digest, state: [...state] }),
+    );
+    if (!wantJson) console.log(`\n  wrote ${dumpState}`);
   }
 
   session.destroy();

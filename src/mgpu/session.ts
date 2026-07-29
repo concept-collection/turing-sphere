@@ -22,6 +22,7 @@ export interface ModelSessionOptions {
 }
 
 export class ModelSession {
+  readonly device: GPUDevice;
   readonly model: MModel;
   readonly cfg: ShtConfig;
   readonly sht: ShtPlan;
@@ -35,12 +36,14 @@ export class ModelSession {
   #params: ModelParams;
 
   private constructor(init: {
+    device: GPUDevice;
     model: MModel;
     cfg: ShtConfig;
     sht: ShtPlan;
     gpu: GpuModel;
     params: ModelParams;
   }) {
+    this.device = init.device;
     this.model = init.model;
     this.cfg = init.cfg;
     this.sht = init.sht;
@@ -65,7 +68,7 @@ export class ModelSession {
         view: model.species,
       });
       gpu.setParams(params);
-      return new ModelSession({ model, cfg, sht, gpu, params });
+      return new ModelSession({ device, model, cfg, sht, gpu, params });
     } catch (e) {
       // The transform plan owns GPU buffers; do not leak them on a compile error.
       sht.destroy();
@@ -90,6 +93,16 @@ export class ModelSession {
     this.gpu.step(n);
     this.t += n * (this.#params.dt ?? 0);
     this.steps += n;
+  }
+
+  /**
+   * Wait for the submitted steps to finish, without reading anything back.
+   * This is the honest way to time the solver: a readback would add a GPU->CPU
+   * round trip, which in a browser also crosses a process boundary and can cost
+   * more than the steps themselves.
+   */
+  sync(): Promise<undefined> {
+    return this.device.queue.onSubmittedWorkDone();
   }
 
   /** Read a named value (a grid field or the spectral state). */

@@ -7,9 +7,11 @@
  *
  * Results are posted to window.__RESULTS__ for the headless runner.
  */
-import { requestShtDevice } from '../src/sht/sht.ts';
+import { requestShtDevice, describeAdapter } from '../src/sht/sht.ts';
 import { ModelSession } from '../src/mgpu/session.ts';
 import { mModels, defaultParams } from '../src/mgpu/registry.ts';
+import { digestOf, formatDigest, type StateDigest } from '../src/mgpu/digest.ts';
+import { parseArgs, modelForSpec, formatCommand } from '../src/bench/runSpec.ts';
 import { transformChecks } from './transformChecks.ts';
 import { analyticChecks } from './analyticChecks.ts';
 import { modelChecks } from './modelChecks.ts';
@@ -17,6 +19,8 @@ import { modelChecks } from './modelChecks.ts';
 declare global {
   interface Window {
     __RESULTS__?: { ok: boolean; fatal?: string; lines: string[] };
+    /** Set by the ?state= mode, for scripts/compare-env.mjs. */
+    __STATE__?: { digest: StateDigest; state: number[] };
   }
 }
 
@@ -88,8 +92,47 @@ async function soak(steps: number, lmax: number): Promise<void> {
   log(failures === 0 ? 'ALL PASS' : `${failures} FAILURE(S)`);
 }
 
+/**
+ * Run one exact spec and post its final state, for scripts/compare-env.mjs to
+ * compare against the same spec run on the desktop. Query parameters map
+ * straight onto the benchmark's flags — `?state=1&lmax=31&steps=200` — and go
+ * through the same parseArgs, so neither side can quietly use different
+ * defaults.
+ */
+async function dumpState(q: URLSearchParams): Promise<void> {
+  const argv: string[] = [];
+  for (const [k, v] of q) {
+    if (k === 'state') continue;
+    argv.push(`--${k}`, v);
+  }
+  const spec = parseArgs(argv);
+  const model = modelForSpec(spec);
+
+  const device = await requestShtDevice();
+  const adapter = await describeAdapter(device);
+  const session = await ModelSession.create({
+    device,
+    model,
+    params: spec.params,
+    lmax: spec.lmax,
+  });
+  session.seed(spec.seed);
+  session.step(spec.steps);
+  await session.sync();
+  const state = await session.read(model.state[0]);
+  const digest = digestOf(state, session.sht.fourierMode, adapter);
+
+  log(`${formatCommand(spec)}\n`);
+  log(`state after ${spec.steps} steps from seed ${spec.seed}:`);
+  log(`  ${formatDigest(digest)}`);
+  log(`  adapter: ${adapter}`);
+  window.__STATE__ = { digest, state: [...state] };
+  session.destroy();
+}
+
 async function main(): Promise<void> {
   const q = new URLSearchParams(location.search);
+  if (q.has('state')) return dumpState(q);
   if (q.has('soak')) {
     return soak(Number(q.get('soak')) || 500, Number(q.get('lmax')) || 63);
   }
