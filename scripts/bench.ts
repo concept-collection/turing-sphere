@@ -196,9 +196,12 @@ try {
   let lastReport = performance.now();
   const tp0 = performance.now();
   let stepsRun = 0;
+  let encodeMs = 0;
   for (let b = 0; b < batches; b++) {
     const n = Math.min(batch, spec.steps - stepsRun);
+    const e0 = performance.now();
     session.step(n);
+    encodeMs += performance.now() - e0;
     await done();
     stepsRun += n;
     if (progress && performance.now() - lastReport > 1000) {
@@ -210,6 +213,7 @@ try {
     }
   }
   const throughputMs = (performance.now() - tp0) / stepsRun;
+  const encodePerStep = encodeMs / stepsRun;
   if (progress) process.stderr.write('\r\x1b[K');
 
   // --- latency: one step per submit, for the distribution ---
@@ -252,7 +256,12 @@ try {
           grid: { lmax: cfg.lmax, nlat: cfg.nlat, nphi: cfg.nphi, nlm: session.sht.nlm },
           compiled: { opsPerStep: plan.step.length, kernels },
           digest,
-          throughput: { batch, msPerStep: throughputMs, stepsPerSec: 1000 / throughputMs },
+          throughput: {
+            batch,
+            msPerStep: throughputMs,
+            stepsPerSec: 1000 / throughputMs,
+            encodeMsPerStep: encodePerStep,
+          },
           latency: t,
           state: {
             t: session.t,
@@ -273,6 +282,10 @@ try {
       `  ${throughputMs.toFixed(2)} ms/step   ${(1000 / throughputMs).toFixed(1)} steps/s   ` +
         `${(spec.params.dt * (1000 / throughputMs)).toFixed(2)} model time/s` +
         `   (batches of ${batch})`,
+    );
+    console.log(
+      `  of which CPU command encoding: ${encodePerStep.toFixed(3)} ms/step ` +
+        `(${((100 * encodePerStep) / throughputMs).toFixed(0)}% — the rest is the GPU)`,
     );
     console.log(
       `  one step per submit: ${t.meanMs.toFixed(2)} ms mean · median ${t.medianMs.toFixed(2)} · ` +

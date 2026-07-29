@@ -21,6 +21,16 @@ declare global {
     __RESULTS__?: { ok: boolean; fatal?: string; lines: string[] };
     /** Set by the ?state= mode, for scripts/compare-env.mjs. */
     __STATE__?: { digest: StateDigest; state: number[] };
+    /** Set by the ?soak= mode, for scripts/compare-perf.mjs. */
+    __SOAK__?: {
+      lmax: number;
+      steps: number;
+      batch: number;
+      solverMsPerStep: number;
+      encodeMsPerStep: number;
+      adapter: string;
+      fourier: 'fft' | 'dft';
+    };
   }
 }
 
@@ -67,11 +77,17 @@ async function soak(steps: number, lmax: number): Promise<void> {
   // waited for, never read back, so it is comparable to `npm run bench`.
   let solverMs = 0;
   let solverSteps = 0;
+  let encodeMs = 0;
   const t0 = performance.now();
   for (let s = 0; s < steps; s += BATCH) {
     const n = Math.min(BATCH, steps - s);
     const b0 = performance.now();
     session.step(n);
+    // CPU-side command encoding, separated from GPU execution: in a browser each
+    // WebGPU call crosses Blink's bindings and Dawn's validation, so on a fast
+    // GPU the encoding can be what actually limits the step rate.
+    const b1 = performance.now();
+    encodeMs += b1 - b0;
     await session.sync();
     solverMs += performance.now() - b0;
     solverSteps += n;
@@ -99,10 +115,12 @@ async function soak(steps: number, lmax: number): Promise<void> {
   let finite = true;
   for (const v of final) if (!Number.isFinite(v)) finite = false;
   const solverPerStep = solverMs / solverSteps;
+  const encodePerStep = encodeMs / solverSteps;
   check(
     `soak: ${steps} steps survived`,
     finite,
     `solver ${solverPerStep.toFixed(2)} ms/step (batches of ${BATCH}, no readback), ` +
+      `of which ${encodePerStep.toFixed(3)} ms/step CPU encoding, ` +
       `${ms.toFixed(2)} ms/step incl. sampling readback`,
   );
   log(
@@ -110,6 +128,15 @@ async function soak(steps: number, lmax: number): Promise<void> {
       `  same .m, same kernels, no rendering on either side.`,
   );
 
+  window.__SOAK__ = {
+    lmax,
+    steps,
+    batch: BATCH,
+    solverMsPerStep: solverPerStep,
+    encodeMsPerStep: encodePerStep,
+    adapter: await describeAdapter(device),
+    fourier: session.sht.fourierMode,
+  };
   session.destroy();
   window.__RESULTS__ = { ok: failures === 0, lines };
   log(failures === 0 ? 'ALL PASS' : `${failures} FAILURE(S)`);

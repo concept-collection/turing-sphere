@@ -230,6 +230,19 @@ Other things the comparison does not control for:
 Some gap is real and some is measurement. Four numbers, in increasing order of
 what they include — walk down them and the gap attributes itself:
 
+```
+node scripts/compare-perf.mjs [--lmax 63] [--steps 300]
+```
+
+measures the same solver work in both — batched, nothing read back, no rendering
+on either side — and reports each with its CPU-encoding share, the Fourier stage,
+and the adapter. It stops you first if the two are not even the same device: a
+browser quietly falling back to a software adapter is a common cause of "the
+browser is much slower", and then the ratio compares different hardware and means
+nothing.
+
+By hand, four numbers, in increasing order of what they include:
+
 | number | includes |
 |---|---|
 | `npm run bench -- --lmax 63` | desktop solver: batched steps, one sync per batch, in-process Dawn |
@@ -246,6 +259,12 @@ remaining suspects are:
   most when the GPU is fast. `npm run bench -- --batch 4` makes the desktop pay a
   sync as often as the app's frame loop does, which shows how much of the gap is
   just amortization.
+- **not CPU command encoding**, which is worth ruling out explicitly because it is
+  the obvious suspect: a step is ~47 WebGPU calls, and 32 of them per burst is a
+  lot of JS→GPU traffic. Measured, it goes the other way — 0.009 ms/step in Chrome
+  against 0.062 ms/step under node-webgpu, because Chrome defers commands to the
+  GPU process while node-webgpu validates them inline. Encoding is *cheaper* in
+  the browser. Both `compare-perf.mjs` and the benchmark print it.
 - **competing with the renderer.** The page draws two spheres through WebGL on the
   same GPU, in its own animation loop. The soak has no renderer, so comparing the
   soak against the app's `solver` separates contention from everything else.
@@ -342,6 +361,9 @@ Other commands:
 - `node scripts/compare-env.mjs` — run one identical spec on the desktop and in a
   browser and compare the final state (see
   [Is it really the same computation?](#is-it-really-the-same-computation)).
+- `node scripts/compare-perf.mjs` — measure the same solver work in both and split
+  the difference (see
+  [Why the browser is slower](#why-the-browser-is-slower-and-how-to-find-out-by-how-much)).
 - `test.html?soak=<steps>&lmax=<n>` — solver-only soak with no rendering.
 
 ### A note on canvas resizing
