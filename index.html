@@ -13,6 +13,11 @@
         --line: #d0d7de;
         --accent: #0969da;
         --sphere-bg: #f4f6f8;
+        --tok-com: #6e7781;
+        --tok-str: #0a3069;
+        --tok-num: #0550ae;
+        --tok-kw: #cf222e;
+        --tok-ext: #8250df;
         color-scheme: light dark;
       }
       @media (prefers-color-scheme: dark) {
@@ -23,6 +28,11 @@
           --line: #333b44;
           --accent: #58a6ff;
           --sphere-bg: #14161c;
+          --tok-com: #8b949e;
+          --tok-str: #a5d6ff;
+          --tok-num: #79c0ff;
+          --tok-kw: #ff7b72;
+          --tok-ext: #d2a8ff;
         }
       }
       body {
@@ -92,6 +102,59 @@
       }
       #blurb { margin-top: 4px; font-size: 13px; color: var(--ink-2); }
       #err { color: #b35900; white-space: pre-wrap; font-size: 13px; }
+      .editor {
+        margin-top: 12px; border: 1px solid var(--line); border-radius: 8px;
+        overflow: hidden;
+      }
+      .editor-head {
+        display: flex; gap: 10px; align-items: center; justify-content: space-between;
+        padding: 6px 10px; font-size: 12px; color: var(--ink-2);
+        background: var(--sphere-bg); border-bottom: 1px solid var(--line);
+      }
+      .editor-head button { padding: 2px 10px; font-size: 12px; }
+      /* Source and compiled-op list side by side, so the editor gets the
+         height rather than sharing it with the list below. */
+      .editor-body { display: flex; align-items: stretch; }
+      .editor-code { position: relative; flex: 1 1 62%; min-width: 0; height: 34em; }
+      /* The overlay and the textarea must agree on every metric that affects
+         where a character lands. Keep these two rules together. */
+      .editor-code > pre,
+      .editor-code > textarea {
+        margin: 0; padding: 10px 12px; border: 0;
+        box-sizing: border-box; width: 100%; height: 100%;
+        font: 12.5px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        tab-size: 2;
+        white-space: pre; overflow-wrap: normal;
+      }
+      #highlight {
+        position: absolute; inset: 0; overflow: hidden;
+        pointer-events: none; background: var(--bg); color: var(--ink);
+      }
+      #source {
+        position: relative; z-index: 1; display: block;
+        resize: none; overflow: auto;
+        background: transparent; color: transparent; caret-color: var(--ink);
+      }
+      #source:focus { outline: none; }
+      /* Transparent text means the selection must be see-through, or selected
+         code would be invisible. */
+      #source::selection { background: color-mix(in srgb, var(--accent) 28%, transparent); }
+      #compiled {
+        flex: 1 1 38%; min-width: 0; margin: 0; padding: 10px 12px; overflow: auto;
+        border-left: 1px solid var(--line); background: var(--sphere-bg);
+        font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        color: var(--ink-2); white-space: pre;
+      }
+      @media (max-width: 860px) {
+        .editor-body { flex-direction: column; }
+        .editor-code { flex: none; height: 26em; }
+        #compiled { border-left: 0; border-top: 1px solid var(--line); max-height: 12em; }
+      }
+      .tok-com { color: var(--tok-com); }
+      .tok-str { color: var(--tok-str); }
+      .tok-num { color: var(--tok-num); }
+      .tok-kw  { color: var(--tok-kw); font-weight: 600; }
+      .tok-ext { color: var(--tok-ext); }
     </style>
   </head>
   <body>
@@ -101,7 +164,9 @@
         Reaction-diffusion on the sphere, solved live with spherical harmonics:
         implicit spectral diffusion + explicit reaction (IMEX Euler), transforms on WebGPU via
         <a href="https://github.com/concept-collection/shtns-webgpu">shtns-webgpu</a>.
-        Drag to rotate.
+        The solver itself is the MATLAB below — <a href="https://numbl.org">numbl</a>
+        parses and lowers it in your browser, and each line becomes a WebGPU
+        compute kernel. Edit it and the pattern changes. Drag to rotate.
       </p>
       <div class="controls">
         <label>preset
@@ -118,12 +183,6 @@
         <label>colormap
           <select id="colormap"></select>
         </label>
-        <label>backend
-          <select id="backend">
-            <option value="webgpu" selected>WebGPU (fp32)</option>
-            <option value="cpu">CPU (f64)</option>
-          </select>
-        </label>
         <button id="runpause" class="primary">Run</button>
         <button id="reseed">Re-seed</button>
         <button id="resetview">Reset view</button>
@@ -131,9 +190,31 @@
       <div class="controls" id="params"></div>
       <div id="panels"></div>
       <p class="stats" id="stats"></p>
+      <div class="editor">
+        <div class="editor-head">
+          <span id="editor-title">the solver, in MATLAB</span>
+          <span>
+            <button id="recompile" type="button">Recompile</button>
+            <button id="revert" type="button">Revert</button>
+          </span>
+        </div>
+        <div class="editor-body">
+          <div class="editor-code">
+            <pre id="highlight" aria-hidden="true"></pre>
+            <textarea
+              id="source"
+              spellcheck="false"
+              autocomplete="off"
+              autocapitalize="off"
+              aria-label="model source (MATLAB)"
+            ></textarea>
+          </div>
+          <pre id="compiled"></pre>
+        </div>
+      </div>
       <div class="cli">
         <div class="cli-head">
-          <span>Same run on the desktop, solver only — compare its ms/step with the one above</span>
+          <span>The same parameters on the desktop, via the reference TypeScript solver</span>
           <button id="copycmd" type="button">Copy</button>
         </div>
         <code id="cmd"></code>

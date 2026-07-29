@@ -1,4 +1,12 @@
 /**
+ * Model metadata and the reference reaction terms.
+ *
+ * The parameter metadata here (names, labels, defaults, slider ranges) is what
+ * the app uses; `src/mgpu/registry.ts` attaches each model's .m source to it, so
+ * the .m running on the GPU and the reference solver used by the tests cannot be
+ * configured differently. The `reaction` / `init` closures below are the
+ * reference implementation only — the app runs the .m instead.
+ *
  * Reaction-diffusion model presets, ported from websph's
  * SphericalReactionDiffusionDriver.m. Each species k solves
  *

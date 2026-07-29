@@ -20,6 +20,15 @@ import {
 
 export type FourierMode = 'auto' | 'fft' | 'dft';
 
+/** The two bind groups (Legendre stage, Fourier stage) of one transform. */
+export interface ShtBinding {
+  readonly bgLeg: GPUBindGroup;
+  readonly bgFour: GPUBindGroup;
+}
+
+const bgEntries = (bufs: GPUBuffer[]) =>
+  bufs.map((buffer, binding) => ({ binding, resource: { buffer } }));
+
 export interface ShtOptions {
   /** Fourier stage implementation.  'auto' picks fft when nphi is a power of two that fits in workgroup memory. */
   fourier?: FourierMode;
@@ -180,8 +189,7 @@ export class ShtPlan {
     this.pipeFourSynth = pFourS;
     this.pipeFourAnalys = pFourA;
 
-    const entries = (bufs: GPUBuffer[]) =>
-      bufs.map((buffer, binding) => ({ binding, resource: { buffer } }));
+    const entries = bgEntries;
     this.bgLegSynth = dev.createBindGroup({
       layout: pLegS.getBindGroupLayout(0),
       entries: entries([this.bufAb, this.bufAmm, this.bufCtstw, this.qlmIn, this.fmBuf]),
@@ -200,37 +208,81 @@ export class ShtPlan {
     });
   }
 
-  /** Record the synthesis (spectral qlmIn -> spatial spatBuf) into an encoder. */
-  encodeSynth(encoder: GPUCommandEncoder): void {
+  /**
+   * Bind groups for one transform against caller-supplied spectral/spatial
+   * buffers, so a transform can read and write buffers it does not own (the
+   * .m-driven executor keeps a buffer per IR variable). Build these once at
+   * plan time, not per step. `fmBuf` stays internal scratch: passes and
+   * dispatches within a submission execute in order, so sequential transforms
+   * can share it.
+   */
+  createSynthBinding(qlmIn: GPUBuffer, spatOut: GPUBuffer): ShtBinding {
+    return {
+      bgLeg: this.device.createBindGroup({
+        layout: this.pipeLegSynth.getBindGroupLayout(0),
+        entries: bgEntries([this.bufAb, this.bufAmm, this.bufCtstw, qlmIn, this.fmBuf]),
+      }),
+      bgFour: this.device.createBindGroup({
+        layout: this.pipeFourSynth.getBindGroupLayout(0),
+        entries: bgEntries([this.fmBuf, spatOut, this.bufTrig]),
+      }),
+    };
+  }
+
+  createAnalysBinding(spatIn: GPUBuffer, qlmOut: GPUBuffer): ShtBinding {
+    return {
+      bgFour: this.device.createBindGroup({
+        layout: this.pipeFourAnalys.getBindGroupLayout(0),
+        entries: bgEntries([spatIn, this.fmBuf, this.bufTrig]),
+      }),
+      bgLeg: this.device.createBindGroup({
+        layout: this.pipeLegAnalys.getBindGroupLayout(0),
+        entries: bgEntries([this.bufAb, this.bufAmm, this.bufCtstw, this.fmBuf, qlmOut]),
+      }),
+    };
+  }
+
+  /** Record synthesis into an existing compute pass. */
+  encodeSynthInto(pass: GPUComputePassEncoder, b: ShtBinding): void {
     const { mmax, nlat, nphi } = this.cfg;
-    const pass = encoder.beginComputePass({ label: 'sht-synth' });
     pass.setPipeline(this.pipeLegSynth);
-    pass.setBindGroup(0, this.bgLegSynth);
+    pass.setBindGroup(0, b.bgLeg);
     pass.dispatchWorkgroups(Math.ceil(nlat / WG_SYNTH), mmax + 1);
     pass.setPipeline(this.pipeFourSynth);
-    pass.setBindGroup(0, this.bgFourSynth);
+    pass.setBindGroup(0, b.bgFour);
     if (this.fourierMode === 'fft') {
       pass.dispatchWorkgroups(nlat);
     } else {
       pass.dispatchWorkgroups(Math.ceil(nphi / 64), nlat);
     }
-    pass.end();
   }
 
-  /** Record the analysis (spatial spatBuf -> spectral qlmOut) into an encoder. */
-  encodeAnalys(encoder: GPUCommandEncoder): void {
+  /** Record analysis into an existing compute pass. */
+  encodeAnalysInto(pass: GPUComputePassEncoder, b: ShtBinding): void {
     const { mmax, nlat } = this.cfg;
-    const pass = encoder.beginComputePass({ label: 'sht-analys' });
     pass.setPipeline(this.pipeFourAnalys);
-    pass.setBindGroup(0, this.bgFourAnalys);
+    pass.setBindGroup(0, b.bgFour);
     if (this.fourierMode === 'fft') {
       pass.dispatchWorkgroups(nlat);
     } else {
       pass.dispatchWorkgroups(Math.ceil((mmax + 1) / 64), nlat);
     }
     pass.setPipeline(this.pipeLegAnalys);
-    pass.setBindGroup(0, this.bgLegAnalys);
+    pass.setBindGroup(0, b.bgLeg);
     pass.dispatchWorkgroups(mmax + 1);
+  }
+
+  /** Record the synthesis (spectral qlmIn -> spatial spatBuf) into an encoder. */
+  encodeSynth(encoder: GPUCommandEncoder): void {
+    const pass = encoder.beginComputePass({ label: 'sht-synth' });
+    this.encodeSynthInto(pass, { bgLeg: this.bgLegSynth, bgFour: this.bgFourSynth });
+    pass.end();
+  }
+
+  /** Record the analysis (spatial spatBuf -> spectral qlmOut) into an encoder. */
+  encodeAnalys(encoder: GPUCommandEncoder): void {
+    const pass = encoder.beginComputePass({ label: 'sht-analys' });
+    this.encodeAnalysInto(pass, { bgLeg: this.bgLegAnalys, bgFour: this.bgFourAnalys });
     pass.end();
   }
 

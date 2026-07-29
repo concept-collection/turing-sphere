@@ -16,6 +16,7 @@
     "bench": "node scripts/bench.mjs"
   },
   "dependencies": {
+    "numbl": "file:../../numbl",
     "three": "^0.183.0"
   },
   "optionalDependencies": {

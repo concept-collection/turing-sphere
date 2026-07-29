@@ -34,6 +34,7 @@ import {
   DEFAULT_BACKEND,
   type RunSpec,
 } from '../src/bench/runSpec.ts';
+import { installWebGpu, errMsg, NO_ADAPTER_HINT } from './nodeWebGpu.ts';
 
 const USAGE = `usage: ${BENCH_COMMAND} [options]
 
@@ -55,7 +56,6 @@ function fail(msg: string, code = 1): never {
   console.error(`bench: ${msg}`);
   process.exit(code);
 }
-const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
 // ---------------------------------------------------------------- arguments
 const argv = process.argv.slice(2);
@@ -69,64 +69,6 @@ try {
   spec = parseArgs(argv.filter((a) => a !== '--json'));
 } catch (e) {
   fail(`${errMsg(e)}\n\n${USAGE}`, 2);
-}
-
-// ---------------------------------------------------------------- WebGPU
-/**
- * Install Dawn under the globals the transform code expects (navigator.gpu,
- * GPUBufferUsage, ...), so src/ runs here unchanged — including
- * requestShtDevice(), which is the same device request the browser makes.
- * The specifier is indirect so that typechecking does not require the
- * optional package to be installed.
- */
-async function installWebGpu(): Promise<string> {
-  const specifier = 'webgpu';
-  let mod: {
-    create: (flags: string[]) => GPU;
-    globals: Record<string, unknown>;
-  };
-  try {
-    mod = await import(specifier);
-  } catch (e) {
-    // Distinguish "not installed" from "installed but the prebuilt Dawn binary
-    // will not load" — the second is what a machine missing a system library
-    // looks like, and reporting it as the first sends people in circles.
-    const detail = errMsg(e);
-    if (/Cannot find (package|module) '?webgpu'?/.test(detail)) {
-      throw new Error(
-        'desktop WebGPU needs the optional `webgpu` package (prebuilt Google Dawn):\n' +
-          '  npm install webgpu\n' +
-          'It is an optionalDependency, so npm can skip it silently — `npm ls webgpu`\n' +
-          'says whether it is there. Or run with --backend cpu.',
-      );
-    }
-    const glibc = /GLIBC_([0-9.]+)/.exec(detail);
-    throw new Error(
-      `the \`webgpu\` package is installed but did not load:\n  ${detail}\n` +
-        (glibc
-          ? `Dawn's prebuilt binary wants glibc ${glibc[1]} or newer and this host is older\n` +
-            '(`ldd --version` says how old). No flag bridges that — use a container with a\n' +
-            'newer base image, or a newer host.\n'
-          : 'That is usually the prebuilt Dawn binary missing a system library.\n') +
-        'Run with --backend cpu for the f64 CPU reference instead.',
-    );
-  }
-  Object.assign(globalThis, mod.globals);
-  // DAWN_FLAGS is ';'-separated because individual Dawn options take
-  // comma-separated lists, e.g. 'enable-dawn-features=allow_unsafe_apis,timestamp_quantization'
-  const dawnFlags = process.env.DAWN_FLAGS?.split(';').filter(Boolean) ?? [];
-  Object.defineProperty(globalThis, 'navigator', {
-    value: { gpu: mod.create(dawnFlags) },
-    configurable: true,
-    writable: true,
-  });
-  const { version } = await import(`${specifier}/package.json`, {
-    with: { type: 'json' },
-  }).then(
-    (m) => m.default as { version: string },
-    () => ({ version: '?' }),
-  );
-  return `node-webgpu ${version} (Google Dawn)`;
 }
 
 // ---------------------------------------------------------------- statistics
@@ -183,10 +125,7 @@ try {
     runtime = await installWebGpu();
     device = await requestShtDevice().catch((e: unknown) => {
       throw new Error(
-        `${errMsg(e)}\n` +
-          '  Dawn reaches the GPU through Vulkan on Linux and Windows, Metal on macOS,\n' +
-          "  so a headless box may have no adapter at all. DAWN_FLAGS='backend=vulkan'\n" +
-          '  makes it explain itself; --backend cpu always works.',
+        `${errMsg(e)}\n${NO_ADAPTER_HINT}\n  --backend cpu always works.`,
       );
     });
     adapter = await describeAdapter(device);

@@ -1,18 +1,17 @@
-import {
-  GpuBackend,
-  CpuBackend,
-  requestShtDevice,
-  describeAdapter,
-  type ShtBackend,
-} from './solver/backend.ts';
-import { Simulation, gridForLmax } from './solver/simulation.ts';
-import { presets, type ModelSpec, type Params } from './solver/models.ts';
+import { requestShtDevice, ShtPlan } from './sht/sht.ts';
+import { describeAdapter } from './solver/backend.ts';
+import { gridForLmax, makeRandn } from './solver/simulation.ts';
+import { presets, type Params } from './solver/models.ts';
+import { GpuModel } from './mgpu/model.ts';
+import { mModelByKey, type MModel } from './mgpu/registry.ts';
+import { ModelCompileError, formatFailure } from './mgpu/errors.ts';
+import { EXTERNAL_OPS } from './mgpu/externals.ts';
+import { CodeEditor } from './editor/codeEditor.ts';
 import {
   formatCommand,
   resolvePreset,
   DEFAULT_STEPS,
   DEFAULT_WARMUP,
-  type BackendKind,
   type RunSpec,
 } from './bench/runSpec.ts';
 import {
@@ -31,7 +30,6 @@ const $ = <T extends HTMLElement>(id: string): T =>
 const elModel = $<HTMLSelectElement>('model');
 const elLmax = $<HTMLSelectElement>('lmax');
 const elColormap = $<HTMLSelectElement>('colormap');
-const elBackend = $<HTMLSelectElement>('backend');
 const elRunPause = $<HTMLButtonElement>('runpause');
 const elReseed = $<HTMLButtonElement>('reseed');
 const elResetView = $<HTMLButtonElement>('resetview');
@@ -42,6 +40,12 @@ const elCmd = $('cmd');
 const elCopyCmd = $<HTMLButtonElement>('copycmd');
 const elBlurb = $('blurb');
 const elErr = $('err');
+const elSource = $<HTMLTextAreaElement>('source');
+const elHighlight = $('highlight');
+const elCompiled = $('compiled');
+const elEditorTitle = $('editor-title');
+const elRecompile = $<HTMLButtonElement>('recompile');
+const elRevert = $<HTMLButtonElement>('revert');
 
 for (const p of presets) {
   const o = document.createElement('option');
@@ -57,10 +61,26 @@ for (const name of colormapNames) {
 }
 elColormap.value = 'jet';
 
+/** The model source, with MATLAB highlighting. The host-provided operations are
+ *  marked so the boundary between the model and what it is given is visible. */
+const editor = new CodeEditor({
+  textarea: elSource,
+  overlay: elHighlight,
+  external: EXTERNAL_OPS,
+  onInput: (value) => {
+    editedSource = value;
+    elRecompile.textContent = 'Recompile *';
+  },
+});
+
+/** Timesteps submitted per rendered frame. Nothing is read back between them,
+ *  so the batch costs one submit and one readback regardless of size. */
+const STEPS_PER_FRAME = 4;
+
 // ---------------------------------------------------------------- state
 let device: GPUDevice | null = null;
-let backend: ShtBackend | null = null;
-let sim: Simulation | null = null;
+let sht: ShtPlan | null = null;
+let gpu: GpuModel | null = null;
 let topo: SphereMeshTopology | null = null;
 let scenes: SphereScene[] = [];
 let colorbars: Colorbar[] = [];
@@ -70,14 +90,20 @@ let ranges: { lo: number; hi: number }[] = [];
 let resizeObs: ResizeObserver | null = null;
 
 const initial = resolvePreset(presets[0].key);
-let model: ModelSpec = initial.model;
+let model: MModel = mModelByKey(initial.model.key)!;
 let params: Params = initial.params;
+/** The .m as edited in the page; `null` while it matches the file. */
+let editedSource: string | null = null;
 let seed = 1;
 let running = false;
 let adapterName = '';
 let pumping = false;
 let stepMs = 0;
+let simTime = 0;
+let stepCount = 0;
 let generation = 0; // bumped on every rebuild to cancel stale pumps
+
+const source = (): string => editedSource ?? model.source;
 
 // ---------------------------------------------------------------- UI wiring
 function buildParamInputs(): void {
@@ -94,6 +120,9 @@ function buildParamInputs(): void {
     input.addEventListener('change', () => {
       const v = Number(input.value);
       if (Number.isFinite(v)) params[spec.key] = v;
+      // Parameters are uniforms, not constants baked into the kernels, so a
+      // change costs an upload rather than a recompile.
+      gpu?.setParams(params);
       updateCommand();
     });
     label.append(input);
@@ -103,8 +132,17 @@ function buildParamInputs(): void {
 
 function applyPreset(presetKey: string): void {
   const resolved = resolvePreset(presetKey);
-  model = resolved.model;
+  const next = mModelByKey(resolved.model.key);
+  if (!next) {
+    elErr.textContent = `No .m model for '${resolved.model.key}'`;
+    return;
+  }
+  model = next;
   params = resolved.params;
+  editedSource = null;
+  editor.value = model.source;
+  elEditorTitle.textContent =
+    `models/${model.key}.m — init() and step(), compiled to WebGPU`;
   buildParamInputs();
   elBlurb.textContent = model.blurb;
   updateCommand();
@@ -115,7 +153,7 @@ function currentSpec(): RunSpec {
   return {
     preset: elModel.value,
     lmax: Number(elLmax.value),
-    backend: elBackend.value as BackendKind,
+    backend: 'webgpu',
     seed,
     steps: DEFAULT_STEPS,
     warmup: DEFAULT_WARMUP,
@@ -132,8 +170,8 @@ elModel.addEventListener('change', () => {
   void rebuild();
 });
 elLmax.addEventListener('change', () => void rebuild());
-elBackend.addEventListener('change', () => void rebuild());
-elColormap.addEventListener('change', () => draw());
+elColormap.addEventListener('change', () => void draw());
+
 function setRunning(next: boolean): void {
   running = next;
   elRunPause.textContent = running ? 'Pause' : 'Run';
@@ -151,8 +189,18 @@ elResetView.addEventListener('click', () => {
   for (const s of scenes) s.resetCamera();
 });
 
-// The command reproduces this exact run on the desktop; keep it selectable
-// even where the clipboard API is unavailable.
+elRecompile.addEventListener('click', () => {
+  editedSource = editor.value;
+  void rebuild();
+});
+elRevert.addEventListener('click', () => {
+  editedSource = null;
+  editor.value = model.source;
+  void rebuild();
+});
+
+// The command reproduces this run's parameters on the desktop; keep it
+// selectable even where the clipboard API is unavailable.
 elCopyCmd.addEventListener('click', () => {
   const text = elCmd.textContent ?? '';
   const flash = (msg: string): void => {
@@ -181,49 +229,82 @@ function disposeView(): void {
   elPanels.replaceChildren();
 }
 
+/** Seeded perturbation, one normal deviate per grid point. */
+function makeNoise(npts: number): Float32Array {
+  const randn = makeRandn(seed);
+  const noise = new Float32Array(npts);
+  for (let i = 0; i < npts; i++) noise[i] = model.seedAmp * randn();
+  return noise;
+}
+
+/** Report a compile failure, and select the offending text in the editor. */
+function reportCompileError(e: unknown): void {
+  elErr.textContent = formatFailure(e, source());
+  elCompiled.textContent = '';
+  if (e instanceof ModelCompileError && e.start !== undefined) {
+    editor.select(e.start, e.end ?? e.start);
+  }
+}
+
 async function rebuild(): Promise<void> {
   generation++;
   const gen = generation;
-  // a rebuild restarts from a fresh initial state, so pause like Re-seed does
   setRunning(false);
   disposeView();
-  backend?.destroy();
-  backend = null;
-  sim = null;
+  gpu?.destroy();
+  gpu = null;
+  sht?.destroy();
+  sht = null;
   stepMs = 0;
+  simTime = 0;
+  stepCount = 0;
+  elErr.textContent = '';
   updateCommand();
+  if (!device) return;
 
   const lmax = Number(elLmax.value);
   const { nlat, nphi } = gridForLmax(lmax, model.pdeg);
   const cfg = { lmax, mmax: lmax, nlat, nphi };
-  const wantGpu = elBackend.value === 'webgpu' && device !== null;
+
   try {
-    backend = wantGpu
-      ? await GpuBackend.create(device!, cfg)
-      : new CpuBackend(cfg);
+    sht = await ShtPlan.create(device, cfg);
+    gpu = await GpuModel.create({
+      device,
+      sht,
+      cfg,
+      source: source(),
+      paramNames: model.params.map((p) => p.key),
+      state: model.state,
+      view: model.species,
+    });
   } catch (e) {
-    elErr.textContent = `Failed to create transform plan: ${e}`;
+    reportCompileError(e);
+    gpu?.destroy();
+    gpu = null;
+    sht?.destroy();
+    sht = null;
     return;
   }
   if (gen !== generation) return;
-  elErr.textContent =
-    !wantGpu && lmax > 31
-      ? 'Heads up: the CPU backend is a direct-summation f64 reference — expect well under 10 steps/s at this lmax.'
-      : '';
 
-  sim = new Simulation(backend, model, params);
-  await sim.init(seed);
-  if (gen !== generation) return;
+  gpu.setParams(params);
+  gpu.init(makeNoise(nlat * nphi));
+
+  const plan = gpu.describe();
+  elCompiled.textContent =
+    `one step compiled to ${plan.step.length} GPU operations:\n` +
+    plan.step.map((l) => `  ${l}`).join('\n');
+  elRecompile.textContent = 'Recompile';
 
   // mesh + scenes
   const phi = new Float64Array(nphi);
   for (let j = 0; j < nphi; j++) phi[j] = (2 * Math.PI * j) / nphi;
-  topo = buildTopology(backend.cosTheta, phi);
+  topo = buildTopology(sht.cosTheta, phi);
 
   const sphereBg = getComputedStyle(document.documentElement)
     .getPropertyValue('--sphere-bg')
     .trim();
-  for (let k = 0; k < sim.nspecies; k++) {
+  for (let k = 0; k < model.species.length; k++) {
     const panel = document.createElement('div');
     panel.className = 'panel';
     const box = document.createElement('div');
@@ -262,29 +343,44 @@ async function rebuild(): Promise<void> {
     .querySelectorAll<HTMLElement>('.sphere-box')
     .forEach((box) => resizeObs!.observe(box));
 
-  draw();
+  await draw();
   updateStats();
   void pump();
 }
 
 async function reseed(): Promise<void> {
-  if (!sim) return;
+  if (!gpu || !sht) return;
   const gen = generation;
-  await sim.init(seed);
+  gpu.init(makeNoise(sht.cfg.nlat * sht.cfg.nphi));
+  simTime = 0;
+  stepCount = 0;
   if (gen !== generation) return;
   for (const r of ranges) {
     r.lo = NaN;
     r.hi = NaN;
   }
-  draw();
+  await draw();
+  updateStats();
 }
 
 // ---------------------------------------------------------------- drawing
-function draw(): void {
-  if (!sim || !topo) return;
+async function draw(): Promise<void> {
+  if (!gpu || !topo) return;
+  const gen = generation;
   const cmap = colormaps[elColormap.value] ?? colormaps.viridis;
-  for (let k = 0; k < sim.nspecies; k++) {
-    fillFieldValues(valueBufs[k], sim.V[k], topo);
+  for (let k = 0; k < model.species.length; k++) {
+    // The one readback per frame — the loop is otherwise entirely on the GPU.
+    // A rebuild can land while this is in flight and destroy the buffer being
+    // mapped, which rejects the map; that result is stale anyway, so drop it.
+    let field: Float32Array;
+    try {
+      field = await gpu.read(model.species[k]);
+    } catch (e) {
+      if (gen !== generation) return;
+      throw e;
+    }
+    if (gen !== generation || !topo) return;
+    fillFieldValues(valueBufs[k], field, topo);
     let lo = Infinity;
     let hi = -Infinity;
     for (const v of valueBufs[k]) {
@@ -314,17 +410,14 @@ function draw(): void {
 }
 
 function updateStats(): void {
-  if (!sim || !backend) return;
-  const { nlat, nphi } = backend.cfg;
-  const kind =
-    backend.kind === 'webgpu'
-      ? `WebGPU fp32${adapterName ? ` — ${adapterName}` : ''}`
-      : 'CPU f64 (direct summation)';
+  if (!gpu || !sht) return;
+  const { nlat, nphi } = sht.cfg;
+  const kind = `WebGPU fp32${adapterName ? ` — ${adapterName}` : ''}`;
   const rate = stepMs > 0 ? `${(1000 / stepMs).toFixed(1)} steps/s` : '—';
   elStats.innerHTML =
-    `<b>${kind}</b> · grid ${nlat}×${nphi} · nlm ${backend.nlm.toLocaleString()} · ` +
+    `<b>${kind}</b> · grid ${nlat}×${nphi} · nlm ${sht.nlm.toLocaleString()} · ` +
     `${stepMs > 0 ? stepMs.toFixed(1) : '—'} ms/step · ${rate} · ` +
-    `t = <b>${sim.t.toFixed(2)}</b> (${sim.stepCount} steps)`;
+    `t = <b>${simTime.toFixed(2)}</b> (${stepCount} steps)`;
 }
 
 // ---------------------------------------------------------------- sim loop
@@ -334,24 +427,23 @@ async function pump(): Promise<void> {
   if (pumping) return;
   pumping = true;
   const gen = generation;
-  let lastYield = performance.now();
   try {
-    while (running && sim && gen === generation) {
+    while (running && gpu && gen === generation) {
       const t0 = performance.now();
-      await sim.step();
-      const dtMs = performance.now() - t0;
+      gpu.step(STEPS_PER_FRAME);
+      // draw() awaits the readback, which also waits for the batch to finish,
+      // so this measures the real end-to-end cost per step.
+      await draw();
+      if (gen !== generation) break;
+      const dtMs = (performance.now() - t0) / STEPS_PER_FRAME;
       stepMs = stepMs === 0 ? dtMs : stepMs + 0.05 * (dtMs - stepMs);
-      const now = performance.now();
-      if (now - lastYield > 25 || backend?.kind === 'cpu') {
-        draw();
-        updateStats();
-        await nextFrame();
-        lastYield = performance.now();
-      }
+      simTime += STEPS_PER_FRAME * (params.dt ?? 0);
+      stepCount += STEPS_PER_FRAME;
+      updateStats();
+      await nextFrame();
     }
-    // final frame after pausing
     if (gen === generation) {
-      draw();
+      await draw();
       updateStats();
     }
   } finally {
@@ -368,15 +460,13 @@ async function boot(): Promise<void> {
     adapterName = await describeAdapter(device);
   } catch (e) {
     device = null;
-    elLmax.value = '31';
-    elBackend.value = 'cpu';
-    elBackend.options[0].disabled = true;
     elErr.textContent =
-      `WebGPU is not available (${e instanceof Error ? e.message : e}); ` +
-      `falling back to the slow CPU transform at low resolution. ` +
-      `Use a WebGPU-capable browser (Chrome/Edge 113+) for the full experience.`;
+      `WebGPU is not available (${e instanceof Error ? e.message : e}). ` +
+      `This demo compiles the MATLAB solver to WebGPU compute shaders, so it ` +
+      `needs a WebGPU-capable browser (Chrome/Edge 113+).`;
+    return;
   }
-  device?.lost.then((info) => {
+  device.lost.then((info) => {
     if (info.reason !== 'destroyed') {
       elErr.textContent = `WebGPU device lost: ${info.message}`;
     }

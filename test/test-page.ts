@@ -7,6 +7,7 @@ import { GpuBackend, CpuBackend, requestShtDevice } from '../src/solver/backend.
 import { Simulation, gridForLmax } from '../src/solver/simulation.ts';
 import { models, defaultParams } from '../src/solver/models.ts';
 import { randomSpectrum } from '../src/sht/reference.ts';
+import { mgpuChecks } from './mgpuChecks.ts';
 
 declare global {
   interface Window {
@@ -163,6 +164,9 @@ async function main(): Promise<void> {
       `u range [${lo.toFixed(4)}, ${hi.toFixed(4)}], ${ms.toFixed(1)} ms/step`);
     gpu.destroy();
   }
+
+  // --- the .m model compiled to WGSL, against the reference solver ---
+  await mgpuChecks(device, check, log);
 
   window.__RESULTS__ = { ok: failures === 0, lines };
   log(failures === 0 ? 'ALL PASS' : `${failures} FAILURE(S)`);

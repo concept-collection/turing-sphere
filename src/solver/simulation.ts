@@ -1,4 +1,11 @@
 /**
+ * Reference solver — NOT what the app runs.
+ *
+ * The app executes the .m models under `models/` on the GPU (see `src/mgpu/`).
+ * This TypeScript port remains as an independent implementation of the same
+ * scheme, which is what makes it usable as the test oracle: `test/mgpuChecks.ts`
+ * runs both from the same seed and compares. Keep the two in step.
+ *
  * IMEX Euler reaction-diffusion timestepper on the sphere, ported from
  * websph's SphericalReactionDiffusion.m. Diffusion is implicit and diagonal
  * in spherical-harmonic space (Laplace-Beltrami eigenvalues -l(l+1));
