@@ -140,6 +140,34 @@ function failureDetail(r, cmd, args) {
   ].join('\n');
 }
 
+/**
+ * Why a run that reported itself is still not usable. Every producer records the
+ * device, the Fourier stage and whether its result stayed finite, so a wrong
+ * answer can be described rather than dumped.
+ */
+function badResult(json) {
+  const b = json.backend ?? {};
+  const lines = [];
+  const first = json.firstRoundTrip;
+  if (first && first.finite === false) {
+    lines.push('a single spectral -> grid -> spectral round trip returns no finite values,');
+    lines.push('so the transforms are wrong on this device — nothing here is worth timing.');
+  } else if (first && !(first.relL2 < 1e-3)) {
+    lines.push(
+      `a single round trip comes back ${Number(first.relL2).toExponential(2)} away from its`,
+    );
+    lines.push('input, far outside fp32 round-off (~1e-7). The transforms are wrong here.');
+  } else if (json.state && json.state.finite === false) {
+    lines.push('it ran, but the final state has no finite values — one round trip is fine,');
+    lines.push('so something diverges over the length of the run.');
+  } else {
+    lines.push('it reported a failure without saying why; run it alone.');
+  }
+  lines.push(`device: ${b.adapter || '(unknown)'}`);
+  if (json.fourier) lines.push(`Fourier stage: ${String(json.fourier).toUpperCase()}`);
+  return lines.map((l, i) => (i === 0 ? l : `      ${l}`)).join('\n');
+}
+
 /** Run one side and parse its --json output. `ok: false` with a reason if it is
  *  not available here — a missing binary, no adapter, no CUDA. */
 function run(label, cmd, args, statePath) {
@@ -152,8 +180,13 @@ function run(label, cmd, args, statePath) {
     maxBuffer: 256 * 1024 * 1024,
   });
   if (r.error) return { label, ok: false, why: r.error.message };
-  if (r.status !== 0) return { label, ok: false, why: failureDetail(r, cmd, full) };
   const json = extractJson(r.stdout);
+  if (r.status !== 0) {
+    // A run that failed but still reported itself is the interesting case: it
+    // computed something wrong rather than failing to start, and it already said
+    // what and on which device. Use that instead of dumping its output.
+    return { label, ok: false, why: json ? badResult(json) : failureDetail(r, cmd, full) };
+  }
   if (!json) {
     return {
       label,

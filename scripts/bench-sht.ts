@@ -23,7 +23,7 @@
 import { ShtPlan, requestShtDevice, describeAdapter, type ShtBinding } from '../src/sht/sht.ts';
 import { lmIndex } from '../src/sht/layout.ts';
 import { makeRand } from '../src/mgpu/noise.ts';
-import { digestOf, formatDigest } from '../src/mgpu/digest.ts';
+import { digestOf, formatDigest, relL2 } from '../src/mgpu/digest.ts';
 import {
   parseArgs,
   configForSpec,
@@ -37,6 +37,8 @@ import {
 import { presets } from '../src/mgpu/registry.ts';
 import { installWebGpu, errMsg, NO_ADAPTER_HINT } from './nodeWebGpu.ts';
 import { writeFileSync } from 'node:fs';
+
+const BENCH_SHT_COMMAND = 'npm run bench:sht --';
 
 const USAGE = `usage: npm run bench:sht -- [options]
 
@@ -196,6 +198,11 @@ try {
     pass.end();
     device!.queue.submit([enc.finish()]);
   };
+  /** `submit` in chunks, so an arbitrary round-trip count does not build one
+   *  command buffer with tens of thousands of dispatches in it. */
+  const submitAll = (n: number, chunk = batch): void => {
+    for (let done = 0; done < n; done += chunk) submit(Math.min(chunk, n - done));
+  };
   const seed = (): void => {
     cur = 0;
     const q0 = seededSpectrum(cfg.lmax, cfg.mmax, nlm, spec.seed);
@@ -226,8 +233,80 @@ try {
     );
   }
 
+  /*
+   * Before timing anything: does one round trip work on this device?
+   *
+   * analys(synth(q)) is the identity for a band-limited q — exact Gauss
+   * quadrature, nphi past the aliasing limit — so a single round trip should
+   * return the input to fp32 round-off, and this is the sharpest check the
+   * transforms are working at all here. Doing it separately means a bad result
+   * says *which* it is: broken from the first transform, or drifted over the
+   * thousands of iterations the timing run does. Otherwise that is a manual
+   * bisection on --steps.
+   */
   seed();
-  submit(spec.warmup);
+  const input = seededSpectrum(cfg.lmax, cfg.mmax, nlm, spec.seed);
+  submit(1);
+  await done();
+  const afterOne = await readSpectrum();
+  const firstFinite = afterOne.every((v) => Number.isFinite(v));
+  const firstRelL2 = firstFinite ? relL2(afterOne, input) : NaN;
+  if (!wantJson) {
+    console.log(
+      `  one round trip: ${
+        firstFinite
+          ? `back to the input to ${firstRelL2.toExponential(2)} relative L2`
+          : 'NOT FINITE'
+      }`,
+    );
+  }
+  if (!firstFinite || !(firstRelL2 < 1e-3)) {
+    // Report it the same way a good run reports itself, so a caller reading
+    // --json learns what went wrong and on which device rather than having to
+    // scrape stderr. Then say it in prose and stop: timing a transform that does
+    // not transform is a waste of minutes.
+    if (wantJson) {
+      console.log(
+        JSON.stringify(
+          {
+            mode: 'transform',
+            spec: { preset: spec.preset, lmax: spec.lmax, seed: spec.seed, steps: spec.steps, warmup: spec.warmup },
+            backend: { library: 'shtns-webgpu (src/sht)', runtime, adapter, precision: 'fp32' },
+            grid: { lmax: cfg.lmax, nlat: cfg.nlat, nphi: cfg.nphi, nlm },
+            fourier: plan.fourierMode,
+            firstRoundTrip: { finite: firstFinite, relL2: firstRelL2 },
+            throughput: null,
+            latency: null,
+            digest: null,
+            input: null,
+            state: { min: null, max: null, finite: firstFinite },
+          },
+          null,
+          2,
+        ),
+      );
+    }
+    const detail = firstFinite
+      ? `it came back ${firstRelL2.toExponential(3)} away from the input, which is far\n` +
+        `  outside fp32 round-off (~1e-7)`
+      : `it came back with no finite values at all`;
+    fail(
+      `a single spectral -> grid -> spectral round trip does not round-trip on this\n` +
+        `  device: ${detail}.\n\n` +
+        `  That is a correctness problem in the transforms here, not a benchmarking one,\n` +
+        `  so there is nothing worth timing yet. Adapter: ${adapter || '(unknown)'};\n` +
+        `  Fourier stage: ${plan.fourierMode.toUpperCase()}.\n\n` +
+        `  Worth trying, in order:\n` +
+        `    npm run test:node                   the repo's own transform check against\n` +
+        `                                        its f64 CPU twin, on this device\n` +
+        `    ${BENCH_SHT_COMMAND} --fourier dft   the other Fourier stage; if this works,\n` +
+        `                                        the WGSL FFT is the problem\n` +
+        `    ${BENCH_SHT_COMMAND} --lmax 15       does it depend on the grid size?`,
+    );
+  }
+
+  seed();
+  submitAll(spec.warmup);
   await done();
 
   // --- throughput: batches submitted together, awaited once each ---
@@ -272,11 +351,9 @@ try {
   let inputDigest = null;
   let state: Float32Array | null = null;
   if (wantDigest) {
-    const input = seededSpectrum(cfg.lmax, cfg.mmax, nlm, spec.seed);
     inputDigest = digestOf(input, plan.fourierMode, adapter);
-    cur = 0;
-    device.queue.writeBuffer(qlm[0], 0, input as Float32Array<ArrayBuffer>);
-    submit(spec.steps);
+    seed();
+    submitAll(spec.steps);
     await done();
     state = await readSpectrum();
     digest = digestOf(state, plan.fourierMode, adapter);
@@ -301,6 +378,7 @@ try {
           backend: { library: 'shtns-webgpu (src/sht)', runtime, adapter, precision: 'fp32' },
           grid: { lmax: cfg.lmax, nlat: cfg.nlat, nphi: cfg.nphi, nlm },
           fourier: plan.fourierMode,
+          firstRoundTrip: { finite: firstFinite, relL2: firstRelL2 },
           throughput: {
             batch,
             msPerStep: throughputMs,
