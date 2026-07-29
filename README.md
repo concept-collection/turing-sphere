@@ -9,7 +9,7 @@ algorithm — [numbl](https://numbl.org) parses and lowers them in the browser, 
 each element-wise line becomes a WebGPU compute kernel. You can edit the MATLAB
 on the page and watch the pattern change.
 
-**Live demo:** <https://concept-collection.github.io/turing-sphere-2/>
+**Live demo:** <https://concept-collection.github.io/turing-sphere/>
 
 ## What it does
 
