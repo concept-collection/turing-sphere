@@ -28,11 +28,13 @@ const elModel = $<HTMLSelectElement>('model');
 const elLmax = $<HTMLSelectElement>('lmax');
 const elColormap = $<HTMLSelectElement>('colormap');
 const elRunPause = $<HTMLButtonElement>('runpause');
+const elBenchmark = $<HTMLButtonElement>('benchmark');
 const elReseed = $<HTMLButtonElement>('reseed');
 const elResetView = $<HTMLButtonElement>('resetview');
 const elParams = $('params');
 const elPanels = $('panels');
 const elStats = $('stats');
+const elBenchResult = $('benchresult');
 const elCmd = $('cmd');
 const elCopyCmd = $<HTMLButtonElement>('copycmd');
 const elBlurb = $('blurb');
@@ -188,6 +190,7 @@ function setRunning(next: boolean): void {
 }
 
 elRunPause.addEventListener('click', () => setRunning(!running));
+elBenchmark.addEventListener('click', () => void benchmark());
 elReseed.addEventListener('click', () => {
   seed = (Math.random() * 2 ** 31) >>> 0;
   setRunning(false);
@@ -454,6 +457,59 @@ async function pump(): Promise<void> {
   } finally {
     pumping = false;
   }
+}
+
+/**
+ * Sustained solver benchmark, in the page.
+ *
+ * The same measurement `npm run bench` makes: batches of steps submitted
+ * together, waited for, never read back, with no rendering and no animation
+ * pacing in between. That makes it directly comparable to the terminal number,
+ * which is the only way to tell a genuinely slower browser GPU stack apart from
+ * the costs the app adds on top.
+ *
+ * It also reports the ramp — the first third of the run against the last. GPUs
+ * downclock when idle, and an animation-paced loop leaves them idle most of every
+ * frame, so a large ramp means the app's steady-state number is limited by clocks
+ * rather than by the work.
+ *
+ * These are ordinary steps: the simulation advances by them.
+ */
+async function benchmark(): Promise<void> {
+  if (!session) return;
+  setRunning(false);
+  const BATCH = 32;
+  const DURATION_MS = 2000;
+  elBenchResult.textContent = 'benchmarking…';
+  await nextFrame();
+
+  const gen = generation;
+  const perStep: number[] = [];
+  const t0 = performance.now();
+  while (performance.now() - t0 < DURATION_MS) {
+    const b0 = performance.now();
+    session.step(BATCH);
+    await session.sync();
+    if (gen !== generation) return;
+    perStep.push((performance.now() - b0) / BATCH);
+  }
+
+  const mean = (xs: number[]): number => xs.reduce((a, b) => a + b, 0) / xs.length;
+  const all = mean(perStep);
+  const best = Math.min(...perStep);
+  const third = Math.max(1, Math.floor(perStep.length / 3));
+  const first = mean(perStep.slice(0, third));
+  const last = mean(perStep.slice(-third));
+  const steps = perStep.length * BATCH;
+
+  elBenchResult.innerHTML =
+    `sustained solver: <b>${all.toFixed(2)} ms/step</b> ` +
+    `(${(1000 / all).toFixed(0)} steps/s) · best ${best.toFixed(2)} · ` +
+    `ramp ${(first / last).toFixed(2)}× (${first.toFixed(2)} → ${last.toFixed(2)}) · ` +
+    `${steps} steps in batches of ${BATCH} · ` +
+    `compare with <code>npm run bench -- --lmax ${session.cfg.lmax}</code>`;
+  await draw();
+  updateStats();
 }
 
 // ---------------------------------------------------------------- boot

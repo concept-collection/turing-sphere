@@ -241,13 +241,21 @@ browser quietly falling back to a software adapter is a common cause of "the
 browser is much slower", and then the ratio compares different hardware and means
 nothing.
 
-By hand, four numbers, in increasing order of what they include:
+Or press **Benchmark** in the app: it pauses rendering and runs batches
+continuously for two seconds, reporting the same measurement the terminal makes,
+plus the **ramp** — the first third of the run against the last. GPUs downclock
+when idle and an animation-paced loop leaves them idle most of every frame, so a
+large ramp means the steady-state number is limited by clocks rather than by the
+work.
+
+By hand, five numbers, in increasing order of what they include:
 
 | number | includes |
 |---|---|
 | `npm run bench -- --lmax 63` | desktop solver: batched steps, one sync per batch, in-process Dawn |
-| `test.html?soak=2000&lmax=63` → `solver` | browser solver: same batching, no rendering at all |
-| the app's `solver` | browser solver, measured in a periodic batch of 32 |
+| the app's **Benchmark** button | browser solver, sustained, no rendering, no pacing |
+| `test.html?soak=2000&lmax=63` → `solver` | the same, without the page around it |
+| the app's `solver` | browser solver, one batch of 32 every two seconds |
 | the app's `ms/frame` | four steps **plus** a readback per species, colormapping and the vertex upload |
 
 If the soak matches the benchmark, the solver is fine in the browser and
@@ -271,7 +279,17 @@ remaining suspects are:
 - **clocks.** An animation-paced loop leaves the GPU idle for most of each 16 ms
   frame, so it may never leave its low-power state, while the benchmark hammers it
   continuously and boosts. On a thermally managed laptop this alone can be worth a
-  factor of two, and it is not something the code can fix.
+  factor of two, and it is not something the code can fix. The **Benchmark**
+  button's ramp figure measures it directly.
+- **anything else using the GPU.** Another process competing for it changes
+  whichever run overlaps it, which makes a comparison across two separate
+  invocations meaningless. `compare-perf.mjs` runs both sides back to back in one
+  invocation partly for this reason.
+- **not buffer robustness**, another plausible suspect: WebGPU clamps every array
+  access for safety, which could cost real time in the transform kernels' inner
+  loops. Measured with Dawn's `disable_robustness` toggle
+  (`DAWN_FLAGS='enable-dawn-features=disable_robustness' npm run bench`), it makes
+  no difference here at all — 0.59 ms/step either way.
 - **which browser.** WebGPU implementations differ substantially in maturity;
   Chrome and Safari are not interchangeable for this.
 
