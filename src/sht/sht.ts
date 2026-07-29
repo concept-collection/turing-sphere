@@ -80,7 +80,9 @@ export class ShtPlan {
   readonly qlmIn!: GPUBuffer;
   /** Spectral output (analysis). */
   readonly qlmOut!: GPUBuffer;
-  /** Fourier-space intermediate [(m)*nlat + ilat], complex f32. */
+  /** Fourier-space intermediate [(m)*nlat + ilat], complex f32. COPY_SRC so the
+   *  stage boundary is observable: a transform is Legendre-then-Fourier, and
+   *  scripts/diagnose-sht.ts tells the two apart by reading this. */
   readonly fmBuf!: GPUBuffer;
   /** Spatial field [ilat*nphi + iphi], f32. */
   readonly spatBuf!: GPUBuffer;
@@ -157,7 +159,7 @@ export class ShtPlan {
     this.bufTrig = mkBuf('sht-trig', 8 * nphi, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     self.qlmIn = mkBuf('sht-qlm-in', 8 * this.nlm, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC);
     self.qlmOut = mkBuf('sht-qlm-out', 8 * this.nlm, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
-    self.fmBuf = mkBuf('sht-fm', 8 * (mmax + 1) * nlat, GPUBufferUsage.STORAGE);
+    self.fmBuf = mkBuf('sht-fm', 8 * (mmax + 1) * nlat, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
     self.spatBuf = mkBuf('sht-spat', 4 * nlat * nphi, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC);
     this.stageSpat = mkBuf('sht-stage-spat', 4 * nlat * nphi, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
     this.stageQ = mkBuf('sht-stage-q', 8 * this.nlm, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);

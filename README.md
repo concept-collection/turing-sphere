@@ -450,6 +450,10 @@ Other commands:
   [Desktop vs browser](#desktop-vs-browser)).
 - `npm run bench:sht -- --help` — the transforms alone, with no solver around
   them, for comparing against upstream SHTNS.
+- `npx vite-node scripts/diagnose-sht.ts` — when the transform tests fail on a GPU,
+  say *which* stage is wrong. It reads the intermediate `fm` back out and scores
+  the Legendre and Fourier stages of each direction separately against the f64
+  reference, then breaks the error down by order `m` and by latitude.
 - `npx vite-node scripts/longrun-node.ts [lmax]` — run to t = 100 and confirm the
   pattern saturates into O(1)-contrast spots rather than decaying or diverging.
 - `node scripts/soak.mjs [steps] [lmax]` — drive the demo for many steps,
