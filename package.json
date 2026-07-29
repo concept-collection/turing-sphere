@@ -1,0 +1,25 @@
+{
+  "name": "turing-sphere",
+  "version": "0.1.0",
+  "description": "Live reaction-diffusion (Turing patterns) on the sphere, spectral spherical-harmonic solver on WebGPU",
+  "type": "module",
+  "license": "CECILL-2.1",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "test:node": "node scripts/test-node.ts",
+    "test:gpu": "vite build && node scripts/test-gpu.mjs",
+    "test": "npm run test:node && npm run test:gpu"
+  },
+  "dependencies": {
+    "three": "^0.183.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "@types/three": "^0.185.1",
+    "@webgpu/types": "^0.1.44",
+    "puppeteer-core": "^23.0.0",
+    "typescript": "^5.5.0",
+    "vite": "^5.4.0"
+  }
+}

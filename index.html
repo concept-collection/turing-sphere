@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><circle cx=%2250%22 cy=%2250%22 r=%2245%22 fill=%22%232a7f62%22/><circle cx=%2235%22 cy=%2238%22 r=%2211%22 fill=%22%23f5d547%22/><circle cx=%2265%22 cy=%2258%22 r=%229%22 fill=%22%23f5d547%22/><circle cx=%2248%22 cy=%2274%22 r=%227%22 fill=%22%23f5d547%22/><circle cx=%2268%22 cy=%2230%22 r=%226%22 fill=%22%23f5d547%22/></svg>" />
+    <title>turing-sphere — reaction-diffusion on the sphere, live in the browser</title>
+    <style>
+      :root {
+        --bg: #ffffff;
+        --ink: #1f2328;
+        --ink-2: #57606a;
+        --line: #d0d7de;
+        --accent: #0969da;
+        --sphere-bg: #f4f6f8;
+        color-scheme: light dark;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #14171a;
+          --ink: #e6e9ec;
+          --ink-2: #9aa4af;
+          --line: #333b44;
+          --accent: #58a6ff;
+          --sphere-bg: #14161c;
+        }
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--ink);
+        font: 15px/1.5 system-ui, -apple-system, sans-serif;
+      }
+      main { max-width: 1100px; margin: 0 auto; padding: 20px 16px 48px; }
+      h1 { font-size: 20px; margin: 0 0 2px; }
+      .sub { color: var(--ink-2); margin: 0 0 12px; font-size: 13px; }
+      .sub a { color: var(--accent); }
+      .controls {
+        display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center;
+        padding: 6px 0;
+      }
+      .controls label { color: var(--ink-2); font-size: 13px; white-space: nowrap; }
+      select, input[type="number"], button {
+        font: inherit; font-size: 13px;
+        color: var(--ink); background: var(--bg);
+        border: 1px solid var(--line); border-radius: 6px;
+        padding: 4px 8px;
+      }
+      input[type="number"] { width: 6em; }
+      button { cursor: pointer; }
+      button:hover { border-color: var(--accent); }
+      button.primary { border-color: var(--accent); color: var(--accent); font-weight: 600; min-width: 5.5em; }
+      #panels {
+        display: flex; flex-wrap: wrap; gap: 14px; margin-top: 12px;
+      }
+      .panel {
+        flex: 1 1 320px; min-width: 280px;
+        border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
+        display: flex;
+      }
+      .sphere-box { flex: 1; aspect-ratio: 1 / 1; max-height: 70vh; position: relative; }
+      .species-tag {
+        position: absolute; top: 8px; left: 10px; z-index: 2;
+        font-size: 15px; font-weight: 600; color: #fff;
+        background: rgba(0, 0, 0, 0.45);
+        padding: 1px 10px; border-radius: 12px;
+        pointer-events: none;
+      }
+      .colorbar {
+        display: flex; flex-direction: column; align-items: center; justify-content: center;
+        gap: 4px; padding: 8px 4px; background: var(--sphere-bg);
+        width: 52px; flex: none; box-sizing: border-box;
+      }
+      .colorbar canvas { border: 1px solid var(--line); border-radius: 2px; }
+      .colorbar-label { font-size: 11px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+      .stats { margin-top: 10px; font-size: 13px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+      .stats b { color: var(--ink); font-weight: 600; }
+      #blurb { margin-top: 4px; font-size: 13px; color: var(--ink-2); }
+      #err { color: #b35900; white-space: pre-wrap; font-size: 13px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>turing-sphere</h1>
+      <p class="sub">
+        Reaction-diffusion on the sphere, solved live with spherical harmonics:
+        implicit spectral diffusion + explicit reaction (IMEX Euler), transforms on WebGPU via
+        <a href="https://github.com/concept-collection/shtns-webgpu">shtns-webgpu</a>.
+        Drag to rotate.
+      </p>
+      <div class="controls">
+        <label>preset
+          <select id="model"></select>
+        </label>
+        <label>lmax
+          <select id="lmax">
+            <option value="31">31</option>
+            <option value="63" selected>63</option>
+            <option value="127">127</option>
+            <option value="255">255</option>
+          </select>
+        </label>
+        <label>colormap
+          <select id="colormap"></select>
+        </label>
+        <label>backend
+          <select id="backend">
+            <option value="webgpu" selected>WebGPU (fp32)</option>
+            <option value="cpu">CPU (f64)</option>
+          </select>
+        </label>
+        <button id="runpause" class="primary">Run</button>
+        <button id="reseed">Re-seed</button>
+        <button id="resetview">Reset view</button>
+      </div>
+      <div class="controls" id="params"></div>
+      <div id="panels"></div>
+      <p class="stats" id="stats"></p>
+      <p id="blurb"></p>
+      <p id="err"></p>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
