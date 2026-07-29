@@ -77,8 +77,24 @@ compute, so this port swaps in:
   and solver cross-checks, plus a 100-step stability run.
 - `node scripts/longrun-node.ts` — CPU run to t = 100 confirming pattern
   saturation.
+- `node scripts/soak.mjs [steps] [lmax] [backend]` — drive the demo for many
+  steps, sampling JS heap and catching crashes. A 900-step run at lmax 63 on
+  software WebGPU (SwiftShader) completes with a flat ~4 MB heap.
 - `node scripts/screenshot.mjs out.png [light|dark] [minSteps]` — screenshot
   the demo after a number of steps.
+- `node scripts/check-live.mjs [url]` — smoke-check a deployed URL in a real
+  browser: load, press Run, confirm the solver advances.
+- `test.html?soak=<steps>&lmax=<n>` — solver-only soak with no rendering.
+
+### A note on canvas resizing
+
+Early long runs killed the browser after ~700–800 steps. The cause was the
+colorbar's min/max labels changing width as their digit count changed, which
+reflowed the panel, fired the `ResizeObserver`, and called
+`renderer.setSize()` — reallocating the WebGL drawing buffer. Assigning
+`canvas.width` also blanks the canvas even when the value is unchanged, so the
+same bug caused visible flicker. Fixed by giving the colorbar column a fixed
+width and making `SphereScene.resize()` return early on no-op resizes.
 
 ## Development
 

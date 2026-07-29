@@ -40,7 +40,52 @@ function relL2(a: ArrayLike<number>, b: ArrayLike<number>): number {
   return Math.sqrt(num / Math.max(den, 1e-300));
 }
 
+/**
+ * Solver-only soak (no rendering), selected with ?soak=<steps>&lmax=<n>.
+ * Isolates the GPU transform loop from the three.js renderer.
+ */
+async function soak(steps: number, lmax: number): Promise<void> {
+  const device = await requestShtDevice();
+  const schnak = models[0];
+  const { nlat, nphi } = gridForLmax(lmax, schnak.pdeg);
+  const gpu = await GpuBackend.create(device, { lmax, mmax: lmax, nlat, nphi });
+  const sim = new Simulation(gpu, schnak, defaultParams(schnak));
+  await sim.init(5);
+  log(`soak: ${steps} steps at lmax ${lmax} (grid ${nlat}x${nphi}), solver only`);
+
+  const t0 = performance.now();
+  for (let s = 0; s < steps; s++) {
+    await sim.step();
+    if ((s + 1) % 100 === 0) {
+      let lo = Infinity;
+      let hi = -Infinity;
+      for (const v of sim.V[0]) {
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+      }
+      const mem = (performance as Performance & { memory?: { usedJSHeapSize: number } }).memory;
+      log(
+        `  step ${s + 1}  u in [${lo.toFixed(4)}, ${hi.toFixed(4)}]` +
+          (mem ? `  heap ${(mem.usedJSHeapSize / 1048576).toFixed(1)} MB` : ''),
+      );
+      // yield so the page stays responsive and the runner can poll
+      await new Promise((r) => setTimeout(r, 0));
+    }
+  }
+  const ms = (performance.now() - t0) / steps;
+  let finite = true;
+  for (const v of sim.V[0]) if (!Number.isFinite(v)) finite = false;
+  check(`soak: ${steps} steps survived`, finite, `${ms.toFixed(1)} ms/step`);
+  gpu.destroy();
+  window.__RESULTS__ = { ok: failures === 0, lines };
+  log(failures === 0 ? 'ALL PASS' : `${failures} FAILURE(S)`);
+}
+
 async function main(): Promise<void> {
+  const q = new URLSearchParams(location.search);
+  if (q.has('soak')) {
+    return soak(Number(q.get('soak')) || 500, Number(q.get('lmax')) || 63);
+  }
   const device = await requestShtDevice();
 
   // --- transform cross-check: GPU vs CPU on a random spectrum ---
