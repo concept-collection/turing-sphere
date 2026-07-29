@@ -40,8 +40,12 @@ function check(name: string, ok: boolean, detail: string): void {
 }
 
 /**
- * Solver-only soak, selected with ?soak=<steps>&lmax=<n>. No rendering, so it
- * isolates the compiled .m and the transforms from three.js.
+ * Solver-only soak, selected with ?soak=<steps>&lmax=<n>.
+ *
+ * No three.js at all, so this is the browser's honest solver rate: the same
+ * batched, no-readback measurement the desktop benchmark reports. If this number
+ * matches the benchmark's but the app's frame cost does not, the difference is
+ * the readback and competing with the renderer for the GPU, not the computation.
  */
 async function soak(steps: number, lmax: number): Promise<void> {
   const device = await requestShtDevice();
@@ -59,9 +63,18 @@ async function soak(steps: number, lmax: number): Promise<void> {
   );
 
   const BATCH = 25;
+  // Timed separately from the sampling: `solverMs` counts only submitted steps
+  // waited for, never read back, so it is comparable to `npm run bench`.
+  let solverMs = 0;
+  let solverSteps = 0;
   const t0 = performance.now();
   for (let s = 0; s < steps; s += BATCH) {
-    session.step(Math.min(BATCH, steps - s));
+    const n = Math.min(BATCH, steps - s);
+    const b0 = performance.now();
+    session.step(n);
+    await session.sync();
+    solverMs += performance.now() - b0;
+    solverSteps += n;
     const u = await session.read(model.species[0]);
     let lo = Infinity;
     let hi = -Infinity;
@@ -85,7 +98,17 @@ async function soak(steps: number, lmax: number): Promise<void> {
   const final = await session.read(model.species[0]);
   let finite = true;
   for (const v of final) if (!Number.isFinite(v)) finite = false;
-  check(`soak: ${steps} steps survived`, finite, `${ms.toFixed(1)} ms/step`);
+  const solverPerStep = solverMs / solverSteps;
+  check(
+    `soak: ${steps} steps survived`,
+    finite,
+    `solver ${solverPerStep.toFixed(2)} ms/step (batches of ${BATCH}, no readback), ` +
+      `${ms.toFixed(2)} ms/step incl. sampling readback`,
+  );
+  log(
+    `  compare 'solver' with the ms/step from \`npm run bench -- --lmax ${lmax}\`:\n` +
+      `  same .m, same kernels, no rendering on either side.`,
+  );
 
   session.destroy();
   window.__RESULTS__ = { ok: failures === 0, lines };

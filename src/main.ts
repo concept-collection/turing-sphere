@@ -74,6 +74,20 @@ const editor = new CodeEditor({
  *  so the batch costs one submit and one readback regardless of size. */
 const STEPS_PER_FRAME = 4;
 
+/**
+ * Steps in a solver-timing burst, and how often to run one.
+ *
+ * Timing the solver needs a `queue.onSubmittedWorkDone()` to know the work
+ * finished, and in a browser that is an IPC round trip into the GPU process — a
+ * fixed cost of a few milliseconds. Spread over one frame's four steps it would
+ * swamp them on a fast GPU and make the solver look far slower than it is. So the
+ * rate is measured in an occasional larger batch, where the single sync is
+ * amortized the way the desktop benchmark amortizes its own. These are ordinary
+ * steps: the simulation advances by them like any others.
+ */
+const MEASURE_BURST = 32;
+const MEASURE_EVERY_MS = 2000;
+
 // ---------------------------------------------------------------- state
 let device: GPUDevice | null = null;
 let session: ModelSession | null = null;
@@ -96,6 +110,7 @@ let adapterName = '';
 let pumping = false;
 let solverMs = 0;
 let frameMs = 0;
+let lastMeasure = 0;
 let generation = 0; // bumped on every rebuild to cancel stale pumps
 
 const source = (): string => editedSource ?? model.source;
@@ -241,6 +256,7 @@ async function rebuild(): Promise<void> {
   session = null;
   solverMs = 0;
   frameMs = 0;
+  lastMeasure = 0;
   elErr.textContent = '';
   updateCommand();
   if (!device) return;
@@ -385,11 +401,12 @@ function updateStats(): void {
   const kind = `WebGPU fp32${adapterName ? ` — ${adapterName}` : ''}`;
   const solver =
     solverMs > 0
-      ? `<b>${solverMs.toFixed(2)} ms/step</b> (${(1000 / solverMs).toFixed(0)} steps/s)`
+      ? `<b>${solverMs.toFixed(2)} ms/step</b> (${(1000 / solverMs).toFixed(0)} steps/s, ` +
+        `batch of ${MEASURE_BURST}, no readback)`
       : '—';
   const frame =
     frameMs > 0
-      ? `${frameMs.toFixed(1)} ms/frame incl. readback + render`
+      ? `${frameMs.toFixed(1)} ms/frame (${STEPS_PER_FRAME} steps + readback + render)`
       : '—';
   elStats.innerHTML =
     `<b>${kind}</b> · grid ${nlat}×${nphi} · nlm ${session.sht.nlm.toLocaleString()} · ` +
@@ -406,23 +423,27 @@ async function pump(): Promise<void> {
   const gen = generation;
   try {
     while (running && session && gen === generation) {
-      // Two separate costs, kept separate. The solver is the batch of steps
-      // alone, waited for but not read back — the number the desktop benchmark
-      // reports, and the only one comparable to it. The frame additionally
-      // carries a GPU->CPU readback per species (which in a browser crosses a
-      // process boundary), the colormapping, and the three.js upload, and those
-      // can easily cost more than the steps do.
+      // Occasionally, a burst purely to measure the solver rate: many steps,
+      // one sync, nothing read back — directly comparable to the desktop
+      // benchmark's throughput number.
+      if (performance.now() - lastMeasure > MEASURE_EVERY_MS) {
+        const m0 = performance.now();
+        session.step(MEASURE_BURST);
+        await session.sync();
+        if (gen !== generation) break;
+        solverMs = (performance.now() - m0) / MEASURE_BURST;
+        lastMeasure = performance.now();
+      }
+
+      // The frame itself. No explicit sync here — draw()'s readback already
+      // waits for the steps, so asking twice would only add a round trip.
       const t0 = performance.now();
       session.step(STEPS_PER_FRAME);
-      await session.sync();
-      if (gen !== generation) break;
-      const tSolver = performance.now();
       await draw();
       if (gen !== generation) break;
-      const ema = (prev: number, next: number): number =>
-        prev === 0 ? next : prev + 0.05 * (next - prev);
-      solverMs = ema(solverMs, (tSolver - t0) / STEPS_PER_FRAME);
-      frameMs = ema(frameMs, performance.now() - t0);
+      frameMs = frameMs === 0
+        ? performance.now() - t0
+        : frameMs + 0.05 * (performance.now() - t0 - frameMs);
       updateStats();
       await nextFrame();
     }

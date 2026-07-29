@@ -225,6 +225,40 @@ Other things the comparison does not control for:
 - both sides are fp32 throughout, on the same generated kernels, so nothing here
   is a numerics comparison — only a cost one.
 
+### Why the browser is slower, and how to find out by how much
+
+Some gap is real and some is measurement. Four numbers, in increasing order of
+what they include — walk down them and the gap attributes itself:
+
+| number | includes |
+|---|---|
+| `npm run bench -- --lmax 63` | desktop solver: batched steps, one sync per batch, in-process Dawn |
+| `test.html?soak=2000&lmax=63` → `solver` | browser solver: same batching, no rendering at all |
+| the app's `solver` | browser solver, measured in a periodic batch of 32 |
+| the app's `ms/frame` | four steps **plus** a readback per species, colormapping and the vertex upload |
+
+If the soak matches the benchmark, the solver is fine in the browser and
+everything above it is readback and rendering. If the soak is itself slower, the
+remaining suspects are:
+
+- **the GPU-process boundary.** Every submit and every sync is IPC out of the
+  renderer; Dawn in Node is in-process. This is a fixed per-batch cost, so it hurts
+  most when the GPU is fast. `npm run bench -- --batch 4` makes the desktop pay a
+  sync as often as the app's frame loop does, which shows how much of the gap is
+  just amortization.
+- **competing with the renderer.** The page draws two spheres through WebGL on the
+  same GPU, in its own animation loop. The soak has no renderer, so comparing the
+  soak against the app's `solver` separates contention from everything else.
+- **clocks.** An animation-paced loop leaves the GPU idle for most of each 16 ms
+  frame, so it may never leave its low-power state, while the benchmark hammers it
+  continuously and boosts. On a thermally managed laptop this alone can be worth a
+  factor of two, and it is not something the code can fix.
+- **which browser.** WebGPU implementations differ substantially in maturity;
+  Chrome and Safari are not interchangeable for this.
+
+None of these change *what* is computed — see below for how to confirm that
+independently.
+
 ### Is it really the same computation?
 
 ```
