@@ -13,7 +13,9 @@
     "test:node": "vite-node scripts/test-node.ts",
     "test:gpu": "vite build && node scripts/test-gpu.mjs",
     "test": "npm run test:node && npm run test:gpu",
-    "bench": "vite-node scripts/bench.ts"
+    "bench": "vite-node scripts/bench.ts",
+    "bench:sht": "vite-node scripts/bench-sht.ts",
+    "bench:native": "node scripts/compare-native.mjs"
   },
   "dependencies": {
     "numbl": "file:../../numbl",

@@ -252,7 +252,7 @@ try {
           command: formatCommand(spec),
           spec,
           model: model.key,
-          backend: { adapter, runtime },
+          backend: { adapter, runtime, precision: 'fp32' },
           grid: { lmax: cfg.lmax, nlat: cfg.nlat, nphi: cfg.nphi, nlm: session.sht.nlm },
           compiled: { opsPerStep: plan.step.length, kernels },
           digest,

@@ -107,7 +107,9 @@ compute, so this port swaps in:
   fp32 spherical harmonic transforms in WGSL compute shaders, modeled on
   [SHTNS](https://nschaeff.bitbucket.io/shtns/). Its source is vendored under
   [`src/sht/`](src/sht/) (CECILL-2.1), including the f64 CPU reference
-  transform used for testing.
+  transform used for testing. [`bench/shtns/`](bench/shtns/) builds the real
+  SHTNS and measures ours against it — see
+  [Against upstream SHTNS](#against-upstream-shtns).
 - **Rendering:** three.js spheres with per-vertex colormaps, adapted from the
   `SphereEmbedding` view in
   [figpack](https://github.com/flatironinstitute/figpack)'s experimental
@@ -319,6 +321,82 @@ genuinely different algorithms that round differently, so a mismatch there
 explains a difference in the values rather than being a symptom of one. The app's
 stats line and the benchmark both print the chosen stage for the same reason.
 
+## Against upstream SHTNS
+
+The transforms are a WGSL translation of
+[SHTNS](https://nschaeff.bitbucket.io/shtns/), and the tests check them against
+their own f64 CPU twin — which shows they are self-consistent, not how they
+compare with the library they are modeled on. SHTNS itself runs on the CPU with
+hand-tuned SIMD codelets, and on Nvidia GPUs with its own CUDA kernels, including
+a single-precision mode. That is a direct comparison, and
+[`bench/shtns/`](bench/shtns/) makes it:
+
+```
+cd bench/shtns && ./bootstrap.sh && make    # clone SHTns at a pinned commit, build
+node scripts/compare-native.mjs --check     # then, from the repo root
+```
+
+`bootstrap.sh` adds CUDA support when `nvcc` is on `PATH`, so the same tree gives
+you the CPU comparison anywhere and the GPU one on a machine with an Nvidia card.
+`compare-native.mjs` runs every implementation present, back to back in one
+invocation so a second process competing for the GPU affects both sides rather
+than one, and prints them in one table — here on a machine with no Nvidia card,
+so the CUDA row is missing rather than invented:
+
+```
+  grid lmax 63 · 128×256 · nlm 2,080   (one synthesis + one analysis per round trip)
+
+  webgpu      0.250 ms/round trip   4000/s   (baseline)     fp32
+              Intel open-source Mesa driver: Mesa 25.0.7 (gen-12lp)
+  shtns cuda  not available — bench/shtns/shtbench_gpu is not built
+  shtns cpu   0.110 ms/round trip   9068/s   0.44x webgpu   fp64
+              CPU, 1 thread
+```
+
+Two things are measured, because they answer different questions:
+
+- **transforms** (`npm run bench:sht` here, `--mode transform` there) — one
+  spectral → grid → spectral round trip and nothing else. This is the
+  library-against-library number, and since the transforms are ~96% of the
+  solver's compute it is what decides how fast the solver can be.
+- **solver** (`npm run bench` here, `--mode solver` there) — a whole IMEX Euler
+  timestep, which is what the app's `solver` line reports.
+
+`--check` diffs the final spectral state across implementations, which is what
+makes the timing mean anything: two numbers are only comparable if they are the
+cost of the same computation. That check is possible at all because the spectral
+layout and normalization are SHTNS's own — orthonormal with Condon–Shortley,
+coefficients grouped by `m`, `LM(l,m)` agreeing index for index — so a state can
+be diffed element by element with no reindexing. Over 20 steps, fp32 WGSL against
+fp64 SHTNS agrees to **~1e-6** relative L2, for every model.
+
+It is also the check on the one second implementation this repo has. The native
+solver cannot run `models/<key>.m` — C has no numbl — so `bench/shtns/spec.h`
+restates the same arithmetic, one line per line of MATLAB. `--check` is what
+keeps that transcription honest, and `compare-native.mjs` refuses to compare two
+runs whose resolved grid or parameters disagree, which is the other way the two
+sides could drift.
+
+[`bench/shtns/README.md`](bench/shtns/README.md) lists what is *not* identical and
+should be kept in mind when reading the ratio — SHTNS runs its Legendre
+recurrence in fp64 even in fp32 mode for `lmax <= 128` (WebGPU has no fp64 at
+all), the Fourier stages are cuFFT/VkFFT/FFTW against a WGSL FFT, and SHTNS'
+polar optimization is off by default here because we have none.
+
+One thing worth knowing before reading much into a single number: small grids
+flatter the CPU, because a GPU spends most of a small transform on launch latency
+rather than arithmetic. Run a sweep. On an Intel Xe iGPU against one core of the
+same laptop, one round trip costs:
+
+| lmax | grid | WGSL (fp32) | SHTNS, 1 CPU core (fp64) |
+|---|---|---|---|
+| 31 | 64×128 | 0.183 ms | 0.017 ms |
+| 63 | 128×256 | 0.250 ms | 0.110 ms |
+| 127 | 256×512 | 0.733 ms | 0.602 ms |
+
+10x behind at lmax 31, 1.2x at lmax 127 — the same comparison, on the same two
+chips. Whatever a single number says, it is saying it about one grid size.
+
 ## Tests
 
 There is no second implementation of the solver to diff against, so the `.m` path
@@ -352,8 +430,10 @@ invisible in the numbers, so it is asserted directly. (It has already caught one
 regression.)
 
 [`test/transformChecks.ts`](test/transformChecks.ts) is the one remaining
-implementation-vs-implementation check, comparing the WGSL transforms against
-shtns-webgpu's f64 CPU twin.
+implementation-vs-implementation check inside the suite, comparing the WGSL
+transforms against shtns-webgpu's f64 CPU twin. Comparing them against *upstream*
+SHTNS is a separate, opt-in step, because it needs a native toolchain — see
+[Against upstream SHTNS](#against-upstream-shtns).
 
 All three modules run in **both** environments, so the two GPU stacks get the same
 guarantees:
@@ -368,6 +448,8 @@ Other commands:
 
 - `npm run bench -- --help` — the desktop benchmark (see
   [Desktop vs browser](#desktop-vs-browser)).
+- `npm run bench:sht -- --help` — the transforms alone, with no solver around
+  them, for comparing against upstream SHTNS.
 - `npx vite-node scripts/longrun-node.ts [lmax]` — run to t = 100 and confirm the
   pattern saturates into O(1)-contrast spots rather than decaying or diverging.
 - `node scripts/soak.mjs [steps] [lmax]` — drive the demo for many steps,
@@ -382,6 +464,10 @@ Other commands:
 - `node scripts/compare-perf.mjs` — measure the same solver work in both and split
   the difference (see
   [Why the browser is slower](#why-the-browser-is-slower-and-how-to-find-out-by-how-much)).
+- `node scripts/compare-native.mjs` — run one spec through the WGSL transforms and
+  through upstream SHTNS, and line the numbers up (see
+  [Against upstream SHTNS](#against-upstream-shtns)). Needs
+  [`bench/shtns/`](bench/shtns/) built first.
 - `test.html?soak=<steps>&lmax=<n>` — solver-only soak with no rendering.
 
 ### A note on canvas resizing
