@@ -93,7 +93,9 @@ and the WebGPU globals, and the rest runs unchanged).
 Desktop WebGPU comes from the `webgpu` package (prebuilt Dawn, ~70 MB), listed
 as an optional dependency so that a platform it has no binaries for fails the
 install of that package alone rather than the whole tree. `npm install` picks it
-up; without it, only `--backend cpu` runs and the benchmark says so. Other
+up; without it, only `--backend cpu` runs and the benchmark says so. Those
+binaries need glibc 2.29+, which rules out older cluster images (RHEL/Rocky 8 is
+2.28) unless you run inside a container with a newer base. Other
 flags: `--steps`, `--warmup`, `--json`, `--help`; `DAWN_FLAGS='backend=vulkan'`
 (`;`-separated) passes Dawn options through, e.g. to pick a backend or to
 compare against Dawn's own software adapter.

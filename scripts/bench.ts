@@ -100,9 +100,14 @@ async function installWebGpu(): Promise<string> {
           'says whether it is there. Or run with --backend cpu.',
       );
     }
+    const glibc = /GLIBC_([0-9.]+)/.exec(detail);
     throw new Error(
       `the \`webgpu\` package is installed but did not load:\n  ${detail}\n` +
-        'That is usually the prebuilt Dawn binary missing a system library.\n' +
+        (glibc
+          ? `Dawn's prebuilt binary wants glibc ${glibc[1]} or newer and this host is older\n` +
+            '(`ldd --version` says how old). No flag bridges that — use a container with a\n' +
+            'newer base image, or a newer host.\n'
+          : 'That is usually the prebuilt Dawn binary missing a system library.\n') +
         'Run with --backend cpu for the f64 CPU reference instead.',
     );
   }
