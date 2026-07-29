@@ -77,7 +77,7 @@ the app prints the command line that reproduces whatever it is currently
 simulating:
 
 ```
-node scripts/bench.ts --preset schnak-spots --lmax 63 --backend webgpu --steps 2000 \
+node scripts/bench.mjs --preset schnak-spots --lmax 63 --backend webgpu --steps 2000 \
   --seed 1 --a 0.1 --b 0.9 --D1 0.0004 --D2 0.008 --dt 0.05
 ```
 
@@ -146,6 +146,15 @@ npm install
 npm run dev       # local dev server
 npm run build     # type-check + production build to dist/
 ```
+
+The `.ts` entry points under `scripts/` are run by Node directly, which strips
+types without being asked only from Node 22.18 / 23.6 / 24 on. Everything here
+works back to 22.6, where stripping exists but is flagged: the npm scripts pass
+`--experimental-strip-types` themselves, and the benchmark — the one command
+that gets copied to other machines — goes through
+[`scripts/bench.mjs`](scripts/bench.mjs), which re-runs itself with the flag
+when it has to. Invoking a `scripts/*.ts` file by hand on 22.6–22.17 needs the
+flag spelled out.
 
 Deployed to GitHub Pages by `.github/workflows/deploy.yml` on push to `main`.
 

@@ -3,14 +3,17 @@
   "version": "0.1.0",
   "description": "Live reaction-diffusion (Turing patterns) on the sphere, spectral spherical-harmonic solver on WebGPU",
   "type": "module",
+  "engines": {
+    "node": ">=22.6"
+  },
   "license": "CECILL-2.1",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "test:node": "node scripts/test-node.ts",
+    "test:node": "node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/test-node.ts",
     "test:gpu": "vite build && node scripts/test-gpu.mjs",
     "test": "npm run test:node && npm run test:gpu",
-    "bench": "node scripts/bench.ts"
+    "bench": "node scripts/bench.mjs"
   },
   "dependencies": {
     "three": "^0.183.0"

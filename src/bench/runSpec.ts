@@ -1,7 +1,7 @@
 /**
  * One solver run, described in a single object shared by the browser app and
  * the command-line benchmark.  The app formats the run it is currently showing
- * into a `node scripts/bench.ts ...` command; the benchmark parses that command
+ * into a `node scripts/bench.mjs ...` command; the benchmark parses that command
  * back into the same object and drives the same Simulation with it.  Neither
  * side keeps its own copy of the defaults, so the two runs cannot drift apart.
  */
@@ -33,8 +33,10 @@ export interface RunSpec {
   params: Params;
 }
 
-/** The command the app displays and the benchmark answers to. */
-export const BENCH_COMMAND = 'node scripts/bench.ts';
+/** The command the app displays and the benchmark answers to.  It names the
+ *  .mjs wrapper rather than bench.ts, so that it also runs on a Node that
+ *  needs to be told to strip types (see scripts/bench.mjs). */
+export const BENCH_COMMAND = 'node scripts/bench.mjs';
 export const DEFAULT_LMAX = 63;
 export const DEFAULT_SEED = 1;
 /** Long enough that clock ramp-up and the occasional scheduling hiccup wash

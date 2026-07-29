@@ -5,10 +5,11 @@
  * reference, and report ms/step.  The app prints the matching command under
  * its stats line; copy it and run it here for an apples-to-apples comparison.
  *
- *   node scripts/bench.ts --preset schnak-spots --lmax 63 --backend webgpu \
- *     --steps 500 --seed 1 --a 0.1 --b 0.9 --D1 0.0004 --D2 0.008 --dt 0.05
+ *   node scripts/bench.mjs --preset schnak-spots --lmax 63 --backend webgpu \
+ *     --steps 2000 --seed 1 --a 0.1 --b 0.9 --D1 0.0004 --D2 0.008 --dt 0.05
  *
  * The only thing missing here is the rendering: this is the solver alone.
+ * Entry point is scripts/bench.mjs, which copes with older Node versions.
  */
 import {
   GpuBackend,
