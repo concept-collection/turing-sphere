@@ -96,6 +96,50 @@ const tmp = (tag) => join(tmpdir(), `turing-sphere-native-${tag}-${process.pid}.
 const cleanup = [];
 
 // ------------------------------------------------------------------- runners
+/**
+ * Pull our JSON object out of stdout.
+ *
+ * A linked library shares the process's stdout, and SHTns writes to it
+ * unconditionally — it announces the GPU it found, which FFT layout it chose and
+ * which VkFFT it linked, none of it gated by shtns_verbose(). So the object may
+ * not start at byte 0. Every producer here prints it with `{` alone on a line and
+ * `}` alone on the last, which is enough to find it.
+ */
+function extractJson(out) {
+  try {
+    return JSON.parse(out);
+  } catch {
+    /* there is something else on stdout; find where the object starts */
+  }
+  const start = out.search(/^\{$/m);
+  const ends = [...out.matchAll(/^\}$/gm)];
+  if (start < 0 || !ends.length) return null;
+  const last = ends[ends.length - 1];
+  try {
+    return JSON.parse(out.slice(start, last.index + 1));
+  } catch {
+    return null;
+  }
+}
+
+/** Dawn reports two of these on every start-up; they are not the failure. */
+const NOISE = /^Warning: max(Dynamic|Compute|Storage)/;
+
+/** The tail of a failed run's output, which is where the actual error is. */
+function failureDetail(r, cmd, args) {
+  const lines = `${r.stderr ?? ''}\n${r.stdout ?? ''}`
+    .split('\n')
+    .map((s) => s.trimEnd())
+    .filter((s) => s && !NOISE.test(s));
+  const tail = lines.slice(-14).map((l) => `      ${l}`);
+  return [
+    `exit ${r.status}`,
+    ...tail,
+    `      re-run it alone to see everything:`,
+    `        ${cmd} ${args.join(' ')}`,
+  ].join('\n');
+}
+
 /** Run one side and parse its --json output. `ok: false` with a reason if it is
  *  not available here — a missing binary, no adapter, no CUDA. */
 function run(label, cmd, args, statePath) {
@@ -108,15 +152,14 @@ function run(label, cmd, args, statePath) {
     maxBuffer: 256 * 1024 * 1024,
   });
   if (r.error) return { label, ok: false, why: r.error.message };
-  if (r.status !== 0) {
-    const detail = (r.stderr || r.stdout || '').trim().split('\n').slice(0, 6).join('\n      ');
-    return { label, ok: false, why: detail || `exit ${r.status}` };
-  }
-  let json;
-  try {
-    json = JSON.parse(r.stdout);
-  } catch {
-    return { label, ok: false, why: `did not print JSON:\n      ${r.stdout.slice(0, 300)}` };
+  if (r.status !== 0) return { label, ok: false, why: failureDetail(r, cmd, full) };
+  const json = extractJson(r.stdout);
+  if (!json) {
+    return {
+      label,
+      ok: false,
+      why: `printed no JSON object:\n${failureDetail(r, cmd, full)}`,
+    };
   }
   let state = null;
   if (statePath && existsSync(statePath)) {
@@ -245,8 +288,12 @@ if (gridProblems.length) {
 }
 
 // -------------------------------------------------------------------- report
+// Ratios are against the WGSL run, which is the point of the comparison. If that
+// is the side that failed, fall back to whatever did run and say so, rather than
+// printing "1.00x webgpu" for a run webgpu had no part in.
 const rate = (r) => r.json.throughput.msPerStep;
-const base = rate(good.find((r) => r.label === 'webgpu') ?? good[0]);
+const baseRun = good.find((r) => r.label === 'webgpu') ?? good[0];
+const base = rate(baseRun);
 
 if (wantJson) {
   console.log(
@@ -263,6 +310,7 @@ if (wantJson) {
           threads: Number(threads),
         },
         grid: gridOf(ref),
+        baseline: baseRun.label,
         runs: results.map((r) =>
           r.ok
             ? {
@@ -270,7 +318,7 @@ if (wantJson) {
                 msPerStep: rate(r),
                 stepsPerSec: r.json.throughput.stepsPerSec,
                 encodeMsPerStep: r.json.throughput.encodeMsPerStep,
-                ratioToWebgpu: rate(r) / base,
+                ratioToBaseline: rate(r) / base,
                 precision: r.json.backend.precision,
                 adapter: r.json.backend.adapter,
                 library: r.json.backend.library,
@@ -301,7 +349,7 @@ if (wantJson) {
     console.log(
       `  ${r.label.padEnd(11)} ${ms.toFixed(3)} ${unit}   ` +
         `${r.json.throughput.stepsPerSec.toFixed(0)}/s   ` +
-        `${r.label === 'webgpu' ? '(baseline)' : `${ratio.toFixed(2)}x webgpu`}   ` +
+        `${r === baseRun ? '(baseline)' : `${ratio.toFixed(2)}x ${baseRun.label}`}   ` +
         `${r.json.backend.precision}`,
     );
     console.log(
@@ -310,6 +358,12 @@ if (wantJson) {
           ? `   ·   CPU-side launching ${r.json.throughput.encodeMsPerStep.toFixed(3)} ms/step`
           : ''),
     );
+    if (r === baseRun && baseRun.label !== 'webgpu') {
+      console.log(
+        `  ${''.padEnd(11)} webgpu did not run, so this is the baseline instead — which is` +
+          `\n  ${''.padEnd(11)} not the comparison you wanted. Fix that side first.`,
+      );
+    }
   }
 
   // Same caution compare-perf.mjs takes: a ratio between two different devices
