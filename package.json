@@ -9,10 +9,14 @@
     "build": "tsc --noEmit && vite build",
     "test:node": "node scripts/test-node.ts",
     "test:gpu": "vite build && node scripts/test-gpu.mjs",
-    "test": "npm run test:node && npm run test:gpu"
+    "test": "npm run test:node && npm run test:gpu",
+    "bench": "node scripts/bench.ts"
   },
   "dependencies": {
     "three": "^0.183.0"
+  },
+  "optionalDependencies": {
+    "webgpu": "^0.4.0"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",

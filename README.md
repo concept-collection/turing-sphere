@@ -68,8 +68,49 @@ compute, so this port swaps in:
   f64 CPU path); for pattern formation from 1e-2 seeded noise this is
   inconsequential.
 
+## Desktop vs browser
+
+How much does running this in a browser cost? [`scripts/bench.ts`](scripts/bench.ts)
+answers that by running the *same* code — same `Simulation`, same WGSL
+transforms, same parameters — from Node on desktop WebGPU (Google Dawn), and
+the app prints the command line that reproduces whatever it is currently
+simulating:
+
+```
+node scripts/bench.ts --preset schnak-spots --lmax 63 --backend webgpu --steps 2000 \
+  --seed 1 --a 0.1 --b 0.9 --D1 0.0004 --D2 0.008 --dt 0.05
+```
+
+Copy it from under the stats line, run it, and compare the `ms/step` it reports
+with the app's. Both sides go through the one shared
+[`src/bench/runSpec.ts`](src/bench/runSpec.ts) — the app formats a run into that
+command, the benchmark parses it back — so there is no second copy of the
+defaults for the two runs to drift apart on. Node runs the TypeScript sources
+directly, so `src/` is literally the same code in both places, down to the
+device request in `requestShtDevice()` (Dawn is installed under `navigator.gpu`
+and the WebGPU globals, and the rest runs unchanged).
+
+Desktop WebGPU comes from the optional `webgpu` package (prebuilt Dawn, ~70 MB).
+A plain `npm install` picks it up; `npm install --omit=optional` skips it and
+leaves `--backend cpu` working. Other flags: `--steps`, `--warmup`, `--json`,
+`--help`; `DAWN_FLAGS='backend=vulkan'` (`;`-separated) passes Dawn options
+through, e.g. to pick a backend or compare against Dawn's own software adapter.
+
+What the comparison does and does not control for:
+
+- the benchmark is **solver only**; the app's `ms/step` excludes `draw()` but is
+  still measured on a page that renders two spheres between steps. For a browser
+  number with no rendering at all, open `test.html?soak=2000&lmax=63`.
+- each step is four transforms, each ending in a buffer readback, so both sides
+  are dominated by submit-and-map latency rather than arithmetic — this measures
+  a driver round-trip more than it measures a GPU.
+- the browser adds its own GPU-process boundary and, for a page that is not
+  cross-origin isolated, coarser timers.
+
 ## Tests
 
+- `npm run bench -- --help` — the desktop benchmark above (see
+  [Desktop vs browser](#desktop-vs-browser)).
 - `npm run test:node` — f64 solver correctness in Node: exact single-mode
   linear recurrence, exact uniform-state reaction ODE, and the linearized
   Turing-mode 2×2 IMEX recurrence (all at ~1e-12).

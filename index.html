@@ -75,6 +75,21 @@
       .colorbar-label { font-size: 11px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
       .stats { margin-top: 10px; font-size: 13px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
       .stats b { color: var(--ink); font-weight: 600; }
+      .cli {
+        margin-top: 10px; border: 1px solid var(--line); border-radius: 8px;
+        overflow: hidden;
+      }
+      .cli-head {
+        display: flex; gap: 10px; align-items: center; justify-content: space-between;
+        padding: 6px 10px; font-size: 12px; color: var(--ink-2);
+        background: var(--sphere-bg); border-bottom: 1px solid var(--line);
+      }
+      .cli-head button { padding: 2px 10px; font-size: 12px; }
+      #cmd {
+        display: block; padding: 8px 10px; white-space: pre-wrap;
+        font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        color: var(--ink); user-select: all;
+      }
       #blurb { margin-top: 4px; font-size: 13px; color: var(--ink-2); }
       #err { color: #b35900; white-space: pre-wrap; font-size: 13px; }
     </style>
@@ -116,6 +131,13 @@
       <div class="controls" id="params"></div>
       <div id="panels"></div>
       <p class="stats" id="stats"></p>
+      <div class="cli">
+        <div class="cli-head">
+          <span>Same run on the desktop, solver only — compare its ms/step with the one above</span>
+          <button id="copycmd" type="button">Copy</button>
+        </div>
+        <code id="cmd"></code>
+      </div>
       <p id="blurb"></p>
       <p id="err"></p>
     </main>

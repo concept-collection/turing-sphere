@@ -58,6 +58,29 @@ export class GpuBackend implements ShtBackend {
   }
 }
 
+/** Best-effort human-readable adapter name, so it is clear which GPU (or
+ *  software rasterizer) is actually running the transforms. */
+export async function describeAdapter(device: GPUDevice): Promise<string> {
+  const fmt = (info: GPUAdapterInfo | undefined): string => {
+    if (!info) return '';
+    const parts = [info.description, info.device, info.vendor].filter(
+      (s): s is string => !!s && s.length > 0,
+    );
+    const name = parts[0] ?? '';
+    return info.architecture && !name.includes(info.architecture)
+      ? `${name} (${info.architecture})`.trim()
+      : name;
+  };
+  const own = fmt((device as GPUDevice & { adapterInfo?: GPUAdapterInfo }).adapterInfo);
+  if (own) return own;
+  try {
+    const adapter = await navigator.gpu.requestAdapter();
+    return fmt(adapter?.info);
+  } catch {
+    return '';
+  }
+}
+
 /** f64 CPU backend by direct summation (slow; tests and no-WebGPU fallback). */
 export class CpuBackend implements ShtBackend {
   readonly kind = 'cpu';

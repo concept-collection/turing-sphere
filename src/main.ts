@@ -2,16 +2,19 @@ import {
   GpuBackend,
   CpuBackend,
   requestShtDevice,
+  describeAdapter,
   type ShtBackend,
 } from './solver/backend.ts';
 import { Simulation, gridForLmax } from './solver/simulation.ts';
+import { presets, type ModelSpec, type Params } from './solver/models.ts';
 import {
-  models,
-  presets,
-  defaultParams,
-  type ModelSpec,
-  type Params,
-} from './solver/models.ts';
+  formatCommand,
+  resolvePreset,
+  DEFAULT_STEPS,
+  DEFAULT_WARMUP,
+  type BackendKind,
+  type RunSpec,
+} from './bench/runSpec.ts';
 import {
   buildTopology,
   fillFieldValues,
@@ -35,6 +38,8 @@ const elResetView = $<HTMLButtonElement>('resetview');
 const elParams = $('params');
 const elPanels = $('panels');
 const elStats = $('stats');
+const elCmd = $('cmd');
+const elCopyCmd = $<HTMLButtonElement>('copycmd');
 const elBlurb = $('blurb');
 const elErr = $('err');
 
@@ -64,8 +69,9 @@ let colorBufs: Float32Array[] = [];
 let ranges: { lo: number; hi: number }[] = [];
 let resizeObs: ResizeObserver | null = null;
 
-let model: ModelSpec = models[0];
-let params: Params = defaultParams(model);
+const initial = resolvePreset(presets[0].key);
+let model: ModelSpec = initial.model;
+let params: Params = initial.params;
 let seed = 1;
 let running = false;
 let adapterName = '';
@@ -88,6 +94,7 @@ function buildParamInputs(): void {
     input.addEventListener('change', () => {
       const v = Number(input.value);
       if (Number.isFinite(v)) params[spec.key] = v;
+      updateCommand();
     });
     label.append(input);
     elParams.append(label);
@@ -95,11 +102,29 @@ function buildParamInputs(): void {
 }
 
 function applyPreset(presetKey: string): void {
-  const preset = presets.find((p) => p.key === presetKey) ?? presets[0];
-  model = models.find((m) => m.key === preset.modelKey) ?? models[0];
-  params = { ...defaultParams(model), ...preset.params };
+  const resolved = resolvePreset(presetKey);
+  model = resolved.model;
+  params = resolved.params;
   buildParamInputs();
   elBlurb.textContent = model.blurb;
+  updateCommand();
+}
+
+/** The run currently on screen, as the benchmark's RunSpec. */
+function currentSpec(): RunSpec {
+  return {
+    preset: elModel.value,
+    lmax: Number(elLmax.value),
+    backend: elBackend.value as BackendKind,
+    seed,
+    steps: DEFAULT_STEPS,
+    warmup: DEFAULT_WARMUP,
+    params,
+  };
+}
+
+function updateCommand(): void {
+  elCmd.textContent = formatCommand(currentSpec());
 }
 
 elModel.addEventListener('change', () => {
@@ -119,10 +144,31 @@ elRunPause.addEventListener('click', () => setRunning(!running));
 elReseed.addEventListener('click', () => {
   seed = (Math.random() * 2 ** 31) >>> 0;
   setRunning(false);
+  updateCommand();
   void reseed();
 });
 elResetView.addEventListener('click', () => {
   for (const s of scenes) s.resetCamera();
+});
+
+// The command reproduces this exact run on the desktop; keep it selectable
+// even where the clipboard API is unavailable.
+elCopyCmd.addEventListener('click', () => {
+  const text = elCmd.textContent ?? '';
+  const flash = (msg: string): void => {
+    elCopyCmd.textContent = msg;
+    setTimeout(() => (elCopyCmd.textContent = 'Copy'), 1200);
+  };
+  const selectCommand = (): void => {
+    const range = document.createRange();
+    range.selectNodeContents(elCmd);
+    const sel = getSelection();
+    sel?.removeAllRanges();
+    sel?.addRange(range);
+    flash('Selected');
+  };
+  if (!navigator.clipboard) return selectCommand();
+  navigator.clipboard.writeText(text).then(() => flash('Copied'), selectCommand);
 });
 
 // ---------------------------------------------------------------- setup
@@ -145,6 +191,7 @@ async function rebuild(): Promise<void> {
   backend = null;
   sim = null;
   stepMs = 0;
+  updateCommand();
 
   const lmax = Number(elLmax.value);
   const { nlat, nphi } = gridForLmax(lmax, model.pdeg);
@@ -313,29 +360,6 @@ async function pump(): Promise<void> {
 }
 
 // ---------------------------------------------------------------- boot
-/** Best-effort human-readable adapter name, so it is clear which GPU (or
- *  software rasterizer) is actually running the transforms. */
-async function describeAdapter(dev: GPUDevice): Promise<string> {
-  const fmt = (info: GPUAdapterInfo | undefined): string => {
-    if (!info) return '';
-    const parts = [info.description, info.device, info.vendor].filter(
-      (s): s is string => !!s && s.length > 0,
-    );
-    const name = parts[0] ?? '';
-    return info.architecture && !name.includes(info.architecture)
-      ? `${name} (${info.architecture})`.trim()
-      : name;
-  };
-  const own = fmt((dev as GPUDevice & { adapterInfo?: GPUAdapterInfo }).adapterInfo);
-  if (own) return own;
-  try {
-    const adapter = await navigator.gpu.requestAdapter();
-    return fmt(adapter?.info);
-  } catch {
-    return '';
-  }
-}
-
 async function boot(): Promise<void> {
   elModel.value = presets[0].key;
   applyPreset(presets[0].key);
