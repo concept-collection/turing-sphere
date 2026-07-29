@@ -1,29 +1,27 @@
 /**
- * Command-line benchmark: run exactly the simulation the browser app is
- * running — same solver, same transforms, same parameters — on desktop WebGPU
- * (Google Dawn, via the optional `webgpu` package) or on the f64 CPU
- * reference, and report ms/step.  The app prints the matching command under
- * its stats line; copy it and run it here for an apples-to-apples comparison.
+ * Command-line benchmark: run exactly what the browser runs — the same .m
+ * models, lowered by numbl and compiled to the same WGSL kernels, over the same
+ * transforms — on desktop WebGPU (Google Dawn, via the optional `webgpu`
+ * package), and report ms/step. The app prints the matching command under its
+ * stats line; copy it and run it here for an apples-to-apples comparison.
  *
- *   node scripts/bench.mjs --preset schnak-spots --lmax 63 --backend webgpu \
- *     --steps 2000 --seed 1 --a 0.1 --b 0.9 --D1 0.0004 --D2 0.008 --dt 0.05
+ *   npm run bench -- --preset schnak-spots --lmax 63 --steps 2000 --seed 1 \
+ *     --a 0.1 --b 0.9 --D1 0.0004 --D2 0.008 --dt 0.05
  *
  * The only thing missing here is the rendering: this is the solver alone.
- * Entry point is scripts/bench.mjs, which copes with older Node versions.
+ *
+ * Two numbers are reported, because they answer different questions:
+ *  - throughput: a batch of steps submitted together, awaited once. This is how
+ *    the app runs, and what keeping the state in GPU buffers is for.
+ *  - latency: one step per submit, each awaited. Comparable to a design that
+ *    reads back every step, and the only way to get a per-step distribution.
  */
-import {
-  GpuBackend,
-  CpuBackend,
-  requestShtDevice,
-  describeAdapter,
-  type ShtBackend,
-} from '../src/solver/backend.ts';
-import { Simulation } from '../src/solver/simulation.ts';
-import { presets } from '../src/solver/models.ts';
+import { requestShtDevice, describeAdapter } from '../src/sht/sht.ts';
+import { ModelSession } from '../src/mgpu/session.ts';
+import { presets } from '../src/mgpu/registry.ts';
 import {
   parseArgs,
   modelForSpec,
-  configForSpec,
   resolvePreset,
   formatCommand,
   BENCH_COMMAND,
@@ -31,7 +29,6 @@ import {
   DEFAULT_SEED,
   DEFAULT_STEPS,
   DEFAULT_WARMUP,
-  DEFAULT_BACKEND,
   type RunSpec,
 } from '../src/bench/runSpec.ts';
 import { installWebGpu, errMsg, NO_ADAPTER_HINT } from './nodeWebGpu.ts';
@@ -41,10 +38,10 @@ const USAGE = `usage: ${BENCH_COMMAND} [options]
   --preset <key>    ${presets.map((p) => p.key).join(' | ')}
                     (default ${presets[0].key})
   --lmax <n>        spherical harmonic truncation (default ${DEFAULT_LMAX})
-  --backend <kind>  webgpu | cpu (default ${DEFAULT_BACKEND})
   --steps <n>       timed steps (default ${DEFAULT_STEPS})
   --warmup <n>      untimed steps first (default ${DEFAULT_WARMUP})
   --seed <n>        initial-noise seed (default ${DEFAULT_SEED})
+  --batch <n>       steps per submit for the throughput number (default 16)
   --<param> <v>     any parameter of the preset's model, e.g. --dt 0.05
   --json            machine-readable output
   --help
@@ -64,9 +61,25 @@ if (argv.includes('--help') || argv.includes('-h')) {
   process.exit(0);
 }
 const wantJson = argv.includes('--json');
+let batch = 16;
+const rest: string[] = [];
+for (let i = 0; i < argv.length; i++) {
+  if (argv[i] === '--json') continue;
+  if (argv[i] === '--batch') {
+    batch = Number(argv[++i]);
+    continue;
+  }
+  if (argv[i].startsWith('--batch=')) {
+    batch = Number(argv[i].slice('--batch='.length));
+    continue;
+  }
+  rest.push(argv[i]);
+}
+if (!Number.isInteger(batch) || batch < 1) fail(`--batch must be an integer >= 1`, 2);
+
 let spec: RunSpec;
 try {
-  spec = parseArgs(argv.filter((a) => a !== '--json'));
+  spec = parseArgs(rest);
 } catch (e) {
   fail(`${errMsg(e)}\n\n${USAGE}`, 2);
 }
@@ -113,71 +126,85 @@ function fieldRange(v: ArrayLike<number>): { min: number; max: number } {
 // ---------------------------------------------------------------- run
 const model = modelForSpec(spec);
 const { preset } = resolvePreset(spec.preset);
-const cfg = configForSpec(spec);
 
 let device: GPUDevice | null = null;
-let backend: ShtBackend | null = null;
-let runtime = 'CPU (direct summation, f64)';
-let adapter = '';
+let session: ModelSession | null = null;
 
 try {
-  if (spec.backend === 'webgpu') {
-    runtime = await installWebGpu();
-    device = await requestShtDevice().catch((e: unknown) => {
-      throw new Error(
-        `${errMsg(e)}\n${NO_ADAPTER_HINT}\n  --backend cpu always works.`,
-      );
-    });
-    adapter = await describeAdapter(device);
-    backend = await GpuBackend.create(device, cfg);
-  } else {
-    backend = new CpuBackend(cfg);
-  }
+  const runtime = await installWebGpu();
+  device = await requestShtDevice().catch((e: unknown) => {
+    throw new Error(`${errMsg(e)}\n${NO_ADAPTER_HINT}`);
+  });
+  const adapter = await describeAdapter(device);
 
-  const sim = new Simulation(backend, model, spec.params);
-  await sim.init(spec.seed);
+  session = await ModelSession.create({
+    device,
+    model,
+    params: spec.params,
+    lmax: spec.lmax,
+  });
+  session.seed(spec.seed);
+
+  const plan = session.describe();
+  const kernels = plan.step.filter((l) => l.startsWith('kernel')).length;
+  const cfg = session.cfg;
 
   if (!wantJson) {
-    const kind =
-      spec.backend === 'webgpu'
-        ? `WebGPU fp32${adapter ? ` — ${adapter}` : ''}`
-        : 'CPU f64';
     console.log(`turing-sphere bench — solver only, no rendering\n`);
-    console.log(`  preset    ${preset.label}  (model ${model.key}: ${model.species.join(', ')})`);
+    console.log(`  preset    ${preset.label}  (models/${model.key}.m: ${model.species.join(', ')})`);
     console.log(
       `  params    ${model.params.map((p) => `${p.key}=${spec.params[p.key]}`).join('  ')}`,
     );
     console.log(
-      `  grid      lmax ${cfg.lmax} · ${cfg.nlat}×${cfg.nphi} · nlm ${backend.nlm.toLocaleString()}`,
+      `  grid      lmax ${cfg.lmax} · ${cfg.nlat}×${cfg.nphi} · nlm ${session.sht.nlm.toLocaleString()}`,
     );
-    console.log(`  backend   ${kind}\n            ${runtime}`);
+    console.log(`  compiled  ${plan.step.length} GPU ops/step (${kernels} generated kernels)`);
+    console.log(`  backend   WebGPU fp32${adapter ? ` — ${adapter}` : ''}\n            ${runtime}`);
     console.log(`  run       ${spec.warmup} warmup + ${spec.steps} timed steps, seed ${spec.seed}\n`);
   }
 
-  for (let s = 0; s < spec.warmup; s++) await sim.step();
+  const done = (): Promise<undefined> => device!.queue.onSubmittedWorkDone();
 
-  const samples = new Float64Array(spec.steps);
+  session.step(spec.warmup);
+  await done();
+
+  // --- throughput: batches submitted together, awaited once each ---
+  const batches = Math.max(1, Math.ceil(spec.steps / batch));
   const progress = !wantJson && process.stderr.isTTY;
   let lastReport = performance.now();
-  let running = 0;
-  for (let s = 0; s < spec.steps; s++) {
-    const t0 = performance.now();
-    await sim.step();
-    samples[s] = performance.now() - t0;
-    running += samples[s];
+  const tp0 = performance.now();
+  let stepsRun = 0;
+  for (let b = 0; b < batches; b++) {
+    const n = Math.min(batch, spec.steps - stepsRun);
+    session.step(n);
+    await done();
+    stepsRun += n;
     if (progress && performance.now() - lastReport > 1000) {
+      const so_far = (performance.now() - tp0) / stepsRun;
       process.stderr.write(
-        `\r\x1b[K  ${s + 1}/${spec.steps} steps · ${(running / (s + 1)).toFixed(2)} ms/step`,
+        `\r\x1b[K  ${stepsRun}/${spec.steps} steps · ${so_far.toFixed(2)} ms/step`,
       );
       lastReport = performance.now();
     }
   }
+  const throughputMs = (performance.now() - tp0) / stepsRun;
   if (progress) process.stderr.write('\r\x1b[K');
 
+  // --- latency: one step per submit, for the distribution ---
+  const latencySteps = Math.min(spec.steps, 200);
+  const samples = new Float64Array(latencySteps);
+  for (let s = 0; s < latencySteps; s++) {
+    const t0 = performance.now();
+    session.step(1);
+    await done();
+    samples[s] = performance.now() - t0;
+  }
   const t = timing(samples);
-  const range = fieldRange(sim.V[0]);
+
+  const field = await session.read(model.species[0]);
+  const range = fieldRange(field);
   let finite = true;
-  for (const v of sim.V[0]) if (!Number.isFinite(v)) finite = false;
+  for (const v of field) if (!Number.isFinite(v)) finite = false;
 
   if (wantJson) {
     console.log(
@@ -186,12 +213,14 @@ try {
           command: formatCommand(spec),
           spec,
           model: model.key,
-          backend: { kind: spec.backend, adapter, runtime },
-          grid: { lmax: cfg.lmax, nlat: cfg.nlat, nphi: cfg.nphi, nlm: backend.nlm },
-          timing: t,
+          backend: { adapter, runtime },
+          grid: { lmax: cfg.lmax, nlat: cfg.nlat, nphi: cfg.nphi, nlm: session.sht.nlm },
+          compiled: { opsPerStep: plan.step.length, kernels },
+          throughput: { batch, msPerStep: throughputMs, stepsPerSec: 1000 / throughputMs },
+          latency: t,
           state: {
-            t: sim.t,
-            steps: sim.stepCount,
+            t: session.t,
+            steps: session.steps,
             species: model.species[0],
             min: range.min,
             max: range.max,
@@ -205,30 +234,30 @@ try {
     );
   } else {
     console.log(
-      `  ${t.meanMs.toFixed(2)} ms/step   ${t.stepsPerSec.toFixed(1)} steps/s   ` +
-        `${(spec.params.dt * t.stepsPerSec).toFixed(2)} model time/s`,
+      `  ${throughputMs.toFixed(2)} ms/step   ${(1000 / throughputMs).toFixed(1)} steps/s   ` +
+        `${(spec.params.dt * (1000 / throughputMs)).toFixed(2)} model time/s` +
+        `   (batches of ${batch})`,
     );
     console.log(
-      `  median ${t.medianMs.toFixed(2)} · p05 ${t.p05Ms.toFixed(2)} · ` +
-        `p95 ${t.p95Ms.toFixed(2)} · min ${t.minMs.toFixed(2)} ms  ` +
-        `(${(t.totalMs / 1000).toFixed(1)} s total)`,
+      `  one step per submit: ${t.meanMs.toFixed(2)} ms mean · median ${t.medianMs.toFixed(2)} · ` +
+        `p05 ${t.p05Ms.toFixed(2)} · p95 ${t.p95Ms.toFixed(2)} · min ${t.minMs.toFixed(2)}`,
     );
     console.log(
-      `  after ${sim.stepCount} steps: t = ${sim.t.toFixed(2)}, ` +
+      `  after ${session.steps} steps: t = ${session.t.toFixed(2)}, ` +
         `${model.species[0]} ∈ [${range.min.toFixed(4)}, ${range.max.toFixed(4)}] ` +
         `(contrast ${(range.max - range.min).toFixed(4)})${finite ? '' : '  — NOT FINITE'}`,
     );
     console.log(
-      `\n  Compare with the ms/step in the app's stats line. That one is also the\n` +
-        `  solver alone, but measured while the page renders the spheres.`,
+      `\n  Compare with the ms/step in the app's stats line: same .m, same kernels,\n` +
+        `  but measured while the page renders the spheres.`,
     );
   }
 
-  backend.destroy();
-  device?.destroy();
+  session.destroy();
+  device.destroy();
   process.exit(finite ? 0 : 1);
 } catch (e) {
-  backend?.destroy();
+  session?.destroy();
   device?.destroy();
   fail(errMsg(e));
 }

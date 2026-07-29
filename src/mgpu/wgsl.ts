@@ -195,8 +195,16 @@ function emitExpr(e: IRExpr, ctx: Ctx): string {
       const fn = CALL_FNS[e.name];
       const b = getBuiltin(e.name);
       if (!fn || !b?.elementwise) {
+        // A call numbl resolved to another function in the file gets a mangled
+        // specialization name; a builtin keeps its source-level name. Only the
+        // model's entry points are compiled, so a helper is a distinct failure
+        // from an unsupported builtin and deserves to say so.
+        const isUserFunction = e.cName !== e.name;
         throw new UnsupportedOnGpu(
-          `'${e.name}' cannot be evaluated element-wise on the GPU`,
+          isUserFunction
+            ? `'${e.name}' is a function defined in this model. Only init and ` +
+                `step are compiled — inline its body into the caller.`
+            : `'${e.name}' cannot be evaluated element-wise on the GPU`,
           e.span,
         );
       }

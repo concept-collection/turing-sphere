@@ -156,6 +156,15 @@ export class GpuModel {
     this.#stepPlan.setParams(params);
   }
 
+  /**
+   * Write a host-owned value directly — the spectral state, or one of the input
+   * fields. Lets a test set up an exact initial condition (a single spherical-
+   * harmonic mode, say) instead of going through `init`.
+   */
+  upload(name: string, data: Float32Array): void {
+    this.#host.upload(name, data);
+  }
+
   /** Upload the seeded perturbation and run `init`. */
   init(noise: Float32Array): void {
     this.#host.upload('noise', noise);

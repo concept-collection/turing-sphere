@@ -32,7 +32,9 @@ jobs:
       # --ignore-scripts: npm runs a linked package's `prepare` script, and
       # numbl's is husky, which is not installed here.
       - run: npm ci --ignore-scripts
-      - run: npm run test:node
+      # The checks compile MATLAB to compute shaders, so they need a GPU; the
+      # browser suite below runs the same modules on SwiftShader if there is none.
+      - run: npm run test:node -- --skip-without-gpu
       # headless Chrome + SwiftShader software WebGPU
       - run: npm run test:gpu
         env:

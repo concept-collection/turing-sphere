@@ -113,17 +113,20 @@ compute, so this port swaps in:
   [figpack](https://github.com/flatironinstitute/figpack)'s experimental
   extension package ([`src/render/`](src/render/)).
 - **Solver:** the MATLAB stayed MATLAB. [`models/`](models/) holds the IMEX loop
-  as `.m` files, executed on the GPU by [`src/mgpu/`](src/mgpu/).
+  as `.m` files, executed on the GPU by [`src/mgpu/`](src/mgpu/). There is no
+  second implementation: the app, the desktop benchmark and the tests all compile
+  and run the same `.m`.
 
-[`src/solver/`](src/solver/) still holds the TypeScript port of the same loop. The
-app no longer runs it, but it is an *independent* implementation of the scheme,
-which makes it the test oracle: `npm run test:gpu` runs both from the same seeded
-perturbation through the same transforms and compares. It is also where parameter
-metadata (names, defaults, slider ranges) lives, so the two paths cannot be
-configured differently.
+An earlier version of this repo carried a TypeScript port of the loop alongside
+the `.m`, and used it as the test oracle. That is gone. Two implementations
+agreeing only shows they share assumptions, so the `.m` path is now checked
+against closed-form answers instead — see [Tests](#tests). The one place a second
+implementation is still the right oracle is the transforms themselves, where
+[`src/sht/reference.ts`](src/sht/reference.ts) is shtns-webgpu's own f64
+direct-summation twin.
 
-Because the algorithm is now compiled to compute shaders, **WebGPU is required** —
-there is no CPU fallback in the app (the f64 CPU transform remains, for tests).
+Because the algorithm is compiled to compute shaders, **WebGPU is required** —
+there is no CPU fallback (the f64 CPU transform remains, for tests).
 
 ## Numerics
 
@@ -140,12 +143,12 @@ there is no CPU fallback in the app (the f64 CPU transform remains, for tests).
 ## Desktop vs browser
 
 How much does running this in a browser cost? [`scripts/bench.ts`](scripts/bench.ts)
-runs the reference solver — same WGSL transforms, same parameters — from Node on
-desktop WebGPU (Google Dawn), and the app prints the command line that
-reproduces whatever it is currently simulating:
+runs the *same* thing — same `.m`, lowered by numbl into the same WGSL kernels,
+over the same transforms — from Node on desktop WebGPU (Google Dawn), and the app
+prints the command line that reproduces whatever it is currently simulating:
 
 ```
-node scripts/bench.mjs --preset schnak-spots --lmax 63 --backend webgpu --steps 2000 \
+npm run bench -- --preset schnak-spots --lmax 63 --steps 2000 \
   --seed 1 --a 0.1 --b 0.9 --D1 0.0004 --D2 0.008 --dt 0.05
 ```
 
@@ -153,60 +156,111 @@ Copy it from under the stats line, run it, and compare the `ms/step` it reports
 with the app's. Both sides go through the one shared
 [`src/bench/runSpec.ts`](src/bench/runSpec.ts) — the app formats a run into that
 command, the benchmark parses it back — so there is no second copy of the
-defaults for the two runs to drift apart on. Node runs the TypeScript sources
-directly, so `src/` is literally the same code in both places, down to the
-device request in `requestShtDevice()` (Dawn is installed under `navigator.gpu`
-and the WebGPU globals, and the rest runs unchanged).
+defaults for the two runs to drift apart on. Both then go through the same
+[`ModelSession`](src/mgpu/session.ts), down to the device request in
+`requestShtDevice()` (Dawn is installed under `navigator.gpu` and the WebGPU
+globals, and the rest runs unchanged).
+
+The benchmark runs under `vite-node`, which is what resolves numbl's compiler
+sources and the `?raw` model imports — plain Node cannot (see
+[The numbl dependency](#the-numbl-dependency)).
+
+It reports two numbers, because they answer different questions:
+
+```
+  0.54 ms/step   1857.5 steps/s   92.87 model time/s   (batches of 16)
+  one step per submit: 0.74 ms mean · median 0.60 · p05 0.51 · p95 1.29 · min 0.50
+```
+
+The first is throughput: a batch of steps submitted together and awaited once,
+which is how the app runs and what keeping the state in GPU buffers is for. The
+second is per-step latency, one submit each — comparable to a design that
+synchronises every step, and the only way to get a distribution.
+
+**What the GPU-resident design is worth.** At lmax 31 on an Intel Xe (Mesa, via
+Dawn) this path runs at **0.25 ms/step**, against **3.01 ms/step** for the
+TypeScript solver this repo used to carry — same machine, same transforms, same
+parameters. A **~12x** difference, and almost all of it is the four per-step
+buffer readbacks that version paid and this one does not. Note that CI, which
+only has a software rasterizer, shows no such gap: there the transforms dominate
+and both designs land within ~10% of each other. The saving is real but it is a
+saving on driver round-trips, so it only appears once the GPU is fast.
 
 Desktop WebGPU comes from the `webgpu` package (prebuilt Dawn, ~70 MB), listed
 as an optional dependency so that a platform it has no binaries for fails the
 install of that package alone rather than the whole tree. `npm install` picks it
-up; without it, only `--backend cpu` runs and the benchmark says so. Those
-binaries need glibc 2.29+, which rules out older cluster images (RHEL/Rocky 8 is
-2.28) unless you run inside a container with a newer base. Other
-flags: `--steps`, `--warmup`, `--json`, `--help`; `DAWN_FLAGS='backend=vulkan'`
-(`;`-separated) passes Dawn options through, e.g. to pick a backend or to
-compare against Dawn's own software adapter.
+up; without it there is no desktop GPU to run on and the benchmark says so.
+Those binaries need glibc 2.29+, which rules out older cluster images
+(RHEL/Rocky 8 is 2.28) unless you run inside a container with a newer base. Other
+flags: `--steps`, `--warmup`, `--batch`, `--json`, `--help`;
+`DAWN_FLAGS='backend=vulkan'` (`;`-separated) passes Dawn options through, e.g. to
+pick a backend or to compare against Dawn's own software adapter.
 
 What the comparison does and does not control for:
 
-- **it is not the same solver.** The benchmark runs the TypeScript reference; the
-  app runs the `.m` compiled to WGSL. Node cannot load numbl's TypeScript sources
-  (its internal imports are extensionless-`.js`, which needs a bundler's
-  resolution), so the `.m` path is browser-only for now. Same scheme, same
-  transforms, same parameters — but the reaction and the IMEX update happen in f64
-  on the CPU there and in fp32 on the GPU here.
 - the benchmark is **solver only**; the app's `ms/step` includes the per-frame
-  readback amortized over the step batch. For a browser number with no rendering,
-  open `test.html?soak=2000&lmax=63` (that soak also runs the reference solver).
-- the reference pays a buffer readback on *every* transform — four driver
-  round-trips per step — so it measures submit-and-map latency more than
-  arithmetic. The `.m` path keeps everything in GPU buffers and submits once per
-  batch, which is where its advantage should come from. On the software rasterizer
-  in CI the transforms dominate and the two come out within ~10% of each other;
-  the gap on real hardware is untested.
+  readback amortized over its step batch. For a browser number with no rendering,
+  open `test.html?soak=2000&lmax=63`.
 - the browser adds its own GPU-process boundary and, for a page that is not
   cross-origin isolated, coarser timers.
+- both sides are fp32 throughout, on the same generated kernels, so nothing here
+  is a numerics comparison — only a cost one.
 
 ## Tests
 
-- `npm run bench -- --help` — the desktop benchmark above (see
+There is no second implementation of the solver to diff against, so the `.m` path
+is checked against **closed-form answers**. Each case is one whose evolution is
+known exactly, run through the whole real pipeline — MATLAB source, numbl
+lowering, generated WGSL, GPU transforms — and compared with arithmetic
+([`test/analyticChecks.ts`](test/analyticChecks.ts)):
+
+- **A** — a linear reaction `f(u) = c*u` leaves every spherical-harmonic mode
+  independent, growing by exactly `(1 + dt*c) / (1 + dt*D*l(l+1))` per step. This
+  pins the transform round-trip, the eigenvalue mapping, the IMEX update and the
+  state feedback at once, and checks that nothing leaks between modes. Agrees to
+  ~2e-7 over 20 steps.
+- **B** — a nonlinear reaction on a *uniform* field stays uniform and diffusion
+  cannot touch it, so each step is exactly the scalar ODE map. Agrees to 1.5e-8
+  over 25 steps. Checks that a generated kernel evaluates a nonlinear reaction.
+- **C** — a 1e-6 perturbation of the Schnakenberg fixed point follows the
+  linearized 2x2 IMEX recurrence, and the `(l=24, m=7)` mode is confirmed
+  unstable. Looser (~2e-3) because fp32 keeps only about four digits of a
+  perturbation that small.
+
+Two test models exist only for this: [`test/models/linear.m`](test/models/linear.m)
+and [`test/models/logistic.m`](test/models/logistic.m).
+
+Alongside those, [`test/modelChecks.ts`](test/modelChecks.ts) compiles every model
+the app offers and asserts **how many kernels it compiles to**. That is a fusion
+guard: numbl's lowering emits one statement per *operator* and its inline pass
+folds them back into per-line expression trees, and if that stops happening the
+results stay correct while every operator becomes its own dispatch. It is
+invisible in the numbers, so it is asserted directly. (It has already caught one
+regression.)
+
+[`test/transformChecks.ts`](test/transformChecks.ts) is the one remaining
+implementation-vs-implementation check, comparing the WGSL transforms against
+shtns-webgpu's f64 CPU twin.
+
+All three modules run in **both** environments, so the two GPU stacks get the same
+guarantees:
+
+- `npm run test:node` — under Dawn on the desktop, via `vite-node`. Needs a GPU;
+  pass `--skip-without-gpu` to let a machine without one say so and move on
+  (which is what CI does, since the browser suite covers the same modules).
+- `npm run test:gpu` — builds and drives headless Chrome, on SwiftShader in CI.
+  Also runs the soak.
+
+Other commands:
+
+- `npm run bench -- --help` — the desktop benchmark (see
   [Desktop vs browser](#desktop-vs-browser)).
-- `npm run test:node` — f64 solver correctness in Node: exact single-mode
-  linear recurrence, exact uniform-state reaction ODE, and the linearized
-  Turing-mode 2×2 IMEX recurrence (all at ~1e-12).
-- `npm run test:gpu` — builds and drives headless Chrome: GPU-vs-CPU transform
-  and solver cross-checks, a 100-step stability run, and then for every `.m`
-  model: that it compiles, that its element-wise lines each fuse into exactly one
-  kernel, and that 10 steps agree with the reference solver from the same seed
-  (they agree to ~1e-7 relative L2 — fp32 round-off).
-- `node scripts/longrun-node.ts` — CPU run to t = 100 confirming pattern
-  saturation.
-- `node scripts/soak.mjs [steps] [lmax] [backend]` — drive the demo for many
-  steps, sampling JS heap and catching crashes. A 900-step run at lmax 63 on
-  software WebGPU (SwiftShader) completes with a flat ~4 MB heap.
-- `node scripts/screenshot.mjs out.png [light|dark] [minSteps]` — screenshot
-  the demo after a number of steps.
+- `npx vite-node scripts/longrun-node.ts [lmax]` — run to t = 100 and confirm the
+  pattern saturates into O(1)-contrast spots rather than decaying or diverging.
+- `node scripts/soak.mjs [steps] [lmax]` — drive the demo for many steps,
+  sampling JS heap and catching crashes.
+- `node scripts/screenshot.mjs out.png [light|dark] [minSteps]` — screenshot the
+  demo after a number of steps.
 - `node scripts/check-live.mjs [url]` — smoke-check a deployed URL in a real
   browser: load, press Run, confirm the solver advances.
 - `test.html?soak=<steps>&lmax=<n>` — solver-only soak with no rendering.
@@ -258,14 +312,13 @@ that had none of numbl's own dependencies installed:
 - **the install must pass `--ignore-scripts`.** npm runs a linked package's
   `prepare` script, and numbl's is `husky`, which is not installed in CI.
 
-The `.ts` entry points under `scripts/` are run by Node directly, which strips
-types without being asked only from Node 22.18 / 23.6 / 24 on. Everything here
-works back to 22.6, where stripping exists but is flagged: the npm scripts pass
-`--experimental-strip-types` themselves, and the benchmark — the one command
-that gets copied to other machines — goes through
-[`scripts/bench.mjs`](scripts/bench.mjs), which re-runs itself with the flag
-when it has to. Invoking a `scripts/*.ts` file by hand on 22.6–22.17 needs the
-flag spelled out.
+The `scripts/*.ts` entry points that touch the compiler (the benchmark, the node
+tests, the long run) go through `vite-node`, so they resolve imports exactly as the
+browser build does — the `numbl-src` alias and the `?raw` model imports included.
+Plain `node` cannot: numbl's sources import each other as `./foo.js` while the
+files are `.ts`, which needs a bundler's resolution. Scripts that do not touch the
+compiler (`soak.mjs`, `screenshot.mjs`, `check-live.mjs`, `test-gpu.mjs`) are plain
+`.mjs` and run under `node` directly.
 
 Deployed to GitHub Pages by `.github/workflows/deploy.yml` on push to `main`.
 

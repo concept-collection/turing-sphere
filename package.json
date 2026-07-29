@@ -10,10 +10,10 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "test:node": "node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/test-node.ts",
+    "test:node": "vite-node scripts/test-node.ts",
     "test:gpu": "vite build && node scripts/test-gpu.mjs",
     "test": "npm run test:node && npm run test:gpu",
-    "bench": "node scripts/bench.mjs"
+    "bench": "vite-node scripts/bench.ts"
   },
   "dependencies": {
     "numbl": "file:../../numbl",
@@ -28,6 +28,7 @@
     "@webgpu/types": "^0.1.44",
     "puppeteer-core": "^23.0.0",
     "typescript": "^5.5.0",
-    "vite": "^5.4.0"
+    "vite": "^5.4.0",
+    "vite-node": "^6.0.0"
   }
 }

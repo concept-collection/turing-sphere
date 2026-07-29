@@ -1,9 +1,6 @@
-import { requestShtDevice, ShtPlan } from './sht/sht.ts';
-import { describeAdapter } from './solver/backend.ts';
-import { gridForLmax, makeRandn } from './solver/simulation.ts';
-import { presets, type Params } from './solver/models.ts';
-import { GpuModel } from './mgpu/model.ts';
-import { mModelByKey, type MModel } from './mgpu/registry.ts';
+import { requestShtDevice, describeAdapter } from './sht/sht.ts';
+import { ModelSession } from './mgpu/session.ts';
+import { mModelByKey, presets, type MModel, type Params } from './mgpu/registry.ts';
 import { ModelCompileError, formatFailure } from './mgpu/errors.ts';
 import { EXTERNAL_OPS } from './mgpu/externals.ts';
 import { CodeEditor } from './editor/codeEditor.ts';
@@ -79,8 +76,7 @@ const STEPS_PER_FRAME = 4;
 
 // ---------------------------------------------------------------- state
 let device: GPUDevice | null = null;
-let sht: ShtPlan | null = null;
-let gpu: GpuModel | null = null;
+let session: ModelSession | null = null;
 let topo: SphereMeshTopology | null = null;
 let scenes: SphereScene[] = [];
 let colorbars: Colorbar[] = [];
@@ -99,8 +95,6 @@ let running = false;
 let adapterName = '';
 let pumping = false;
 let stepMs = 0;
-let simTime = 0;
-let stepCount = 0;
 let generation = 0; // bumped on every rebuild to cancel stale pumps
 
 const source = (): string => editedSource ?? model.source;
@@ -122,7 +116,7 @@ function buildParamInputs(): void {
       if (Number.isFinite(v)) params[spec.key] = v;
       // Parameters are uniforms, not constants baked into the kernels, so a
       // change costs an upload rather than a recompile.
-      gpu?.setParams(params);
+      session?.setParams(params);
       updateCommand();
     });
     label.append(input);
@@ -153,7 +147,6 @@ function currentSpec(): RunSpec {
   return {
     preset: elModel.value,
     lmax: Number(elLmax.value),
-    backend: 'webgpu',
     seed,
     steps: DEFAULT_STEPS,
     warmup: DEFAULT_WARMUP,
@@ -229,14 +222,6 @@ function disposeView(): void {
   elPanels.replaceChildren();
 }
 
-/** Seeded perturbation, one normal deviate per grid point. */
-function makeNoise(npts: number): Float32Array {
-  const randn = makeRandn(seed);
-  const noise = new Float32Array(npts);
-  for (let i = 0; i < npts; i++) noise[i] = model.seedAmp * randn();
-  return noise;
-}
-
 /** Report a compile failure, and select the offending text in the editor. */
 function reportCompileError(e: unknown): void {
   elErr.textContent = formatFailure(e, source());
@@ -251,55 +236,40 @@ async function rebuild(): Promise<void> {
   const gen = generation;
   setRunning(false);
   disposeView();
-  gpu?.destroy();
-  gpu = null;
-  sht?.destroy();
-  sht = null;
+  session?.destroy();
+  session = null;
   stepMs = 0;
-  simTime = 0;
-  stepCount = 0;
   elErr.textContent = '';
   updateCommand();
   if (!device) return;
 
-  const lmax = Number(elLmax.value);
-  const { nlat, nphi } = gridForLmax(lmax, model.pdeg);
-  const cfg = { lmax, mmax: lmax, nlat, nphi };
-
   try {
-    sht = await ShtPlan.create(device, cfg);
-    gpu = await GpuModel.create({
+    session = await ModelSession.create({
       device,
-      sht,
-      cfg,
+      model,
+      params,
+      lmax: Number(elLmax.value),
       source: source(),
-      paramNames: model.params.map((p) => p.key),
-      state: model.state,
-      view: model.species,
     });
   } catch (e) {
     reportCompileError(e);
-    gpu?.destroy();
-    gpu = null;
-    sht?.destroy();
-    sht = null;
     return;
   }
   if (gen !== generation) return;
 
-  gpu.setParams(params);
-  gpu.init(makeNoise(nlat * nphi));
+  session.seed(seed);
 
-  const plan = gpu.describe();
+  const plan = session.describe();
   elCompiled.textContent =
     `one step compiled to ${plan.step.length} GPU operations:\n` +
     plan.step.map((l) => `  ${l}`).join('\n');
   elRecompile.textContent = 'Recompile';
 
   // mesh + scenes
+  const { nphi } = session.cfg;
   const phi = new Float64Array(nphi);
   for (let j = 0; j < nphi; j++) phi[j] = (2 * Math.PI * j) / nphi;
-  topo = buildTopology(sht.cosTheta, phi);
+  topo = buildTopology(session.sht.cosTheta, phi);
 
   const sphereBg = getComputedStyle(document.documentElement)
     .getPropertyValue('--sphere-bg')
@@ -349,11 +319,9 @@ async function rebuild(): Promise<void> {
 }
 
 async function reseed(): Promise<void> {
-  if (!gpu || !sht) return;
+  if (!session) return;
   const gen = generation;
-  gpu.init(makeNoise(sht.cfg.nlat * sht.cfg.nphi));
-  simTime = 0;
-  stepCount = 0;
+  session.seed(seed);
   if (gen !== generation) return;
   for (const r of ranges) {
     r.lo = NaN;
@@ -365,7 +333,7 @@ async function reseed(): Promise<void> {
 
 // ---------------------------------------------------------------- drawing
 async function draw(): Promise<void> {
-  if (!gpu || !topo) return;
+  if (!session || !topo) return;
   const gen = generation;
   const cmap = colormaps[elColormap.value] ?? colormaps.viridis;
   for (let k = 0; k < model.species.length; k++) {
@@ -374,7 +342,7 @@ async function draw(): Promise<void> {
     // mapped, which rejects the map; that result is stale anyway, so drop it.
     let field: Float32Array;
     try {
-      field = await gpu.read(model.species[k]);
+      field = await session.read(model.species[k]);
     } catch (e) {
       if (gen !== generation) return;
       throw e;
@@ -410,14 +378,14 @@ async function draw(): Promise<void> {
 }
 
 function updateStats(): void {
-  if (!gpu || !sht) return;
-  const { nlat, nphi } = sht.cfg;
+  if (!session) return;
+  const { nlat, nphi } = session.cfg;
   const kind = `WebGPU fp32${adapterName ? ` — ${adapterName}` : ''}`;
   const rate = stepMs > 0 ? `${(1000 / stepMs).toFixed(1)} steps/s` : '—';
   elStats.innerHTML =
-    `<b>${kind}</b> · grid ${nlat}×${nphi} · nlm ${sht.nlm.toLocaleString()} · ` +
+    `<b>${kind}</b> · grid ${nlat}×${nphi} · nlm ${session.sht.nlm.toLocaleString()} · ` +
     `${stepMs > 0 ? stepMs.toFixed(1) : '—'} ms/step · ${rate} · ` +
-    `t = <b>${simTime.toFixed(2)}</b> (${stepCount} steps)`;
+    `t = <b>${session.t.toFixed(2)}</b> (${session.steps} steps)`;
 }
 
 // ---------------------------------------------------------------- sim loop
@@ -428,17 +396,15 @@ async function pump(): Promise<void> {
   pumping = true;
   const gen = generation;
   try {
-    while (running && gpu && gen === generation) {
+    while (running && session && gen === generation) {
       const t0 = performance.now();
-      gpu.step(STEPS_PER_FRAME);
+      session.step(STEPS_PER_FRAME);
       // draw() awaits the readback, which also waits for the batch to finish,
       // so this measures the real end-to-end cost per step.
       await draw();
       if (gen !== generation) break;
       const dtMs = (performance.now() - t0) / STEPS_PER_FRAME;
       stepMs = stepMs === 0 ? dtMs : stepMs + 0.05 * (dtMs - stepMs);
-      simTime += STEPS_PER_FRAME * (params.dt ?? 0);
-      stepCount += STEPS_PER_FRAME;
       updateStats();
       await nextFrame();
     }

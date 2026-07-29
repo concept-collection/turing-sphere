@@ -1,28 +1,25 @@
 /**
- * One solver run, described in a single object shared by the browser app and
- * the command-line benchmark.  The app formats the run it is currently showing
- * into a `node scripts/bench.mjs ...` command; the benchmark parses that command
- * back into the same object and drives the same Simulation with it.  Neither
- * side keeps its own copy of the defaults, so the two runs cannot drift apart.
+ * One run, described in a single object shared by the browser app and the
+ * command-line benchmark. The app formats the run it is currently showing into a
+ * `npm run bench` command; the benchmark parses that command back into the same
+ * object and compiles the same .m with it. Neither side keeps its own copy of
+ * the defaults, so the two runs cannot drift apart — and both execute the same
+ * MATLAB through the same pipeline, so the comparison is like for like.
  */
 import {
-  models,
+  mModels,
   presets,
   defaultParams,
-  type ModelSpec,
+  type MModel,
   type Params,
   type Preset,
-} from '../solver/models.ts';
-import { gridForLmax } from '../solver/simulation.ts';
-import type { ShtConfig } from '../sht/layout.ts';
-
-export type BackendKind = 'webgpu' | 'cpu';
+} from '../mgpu/registry.ts';
+import { gridForLmax, type ShtConfig } from '../sht/layout.ts';
 
 export interface RunSpec {
-  /** Preset key from models.ts; fixes the model, params may still be edited. */
+  /** Preset key from the registry; fixes the model, params may still be edited. */
   preset: string;
   lmax: number;
-  backend: BackendKind;
   /** Seed of the initial noise. */
   seed: number;
   /** Timed steps (the app runs forever; the benchmark stops here). */
@@ -33,23 +30,22 @@ export interface RunSpec {
   params: Params;
 }
 
-/** The command the app displays and the benchmark answers to.  It names the
- *  .mjs wrapper rather than bench.ts, so that it also runs on a Node that
- *  needs to be told to strip types (see scripts/bench.mjs). */
-export const BENCH_COMMAND = 'node scripts/bench.mjs';
+/** The command the app displays and the benchmark answers to. Goes through npm
+ *  because the benchmark runs under vite-node, which is what resolves numbl's
+ *  compiler sources and the `?raw` model imports. */
+export const BENCH_COMMAND = 'npm run bench --';
 export const DEFAULT_LMAX = 63;
 export const DEFAULT_SEED = 1;
 /** Long enough that clock ramp-up and the occasional scheduling hiccup wash
  *  out: ~10 s of GPU stepping at lmax 63. */
 export const DEFAULT_STEPS = 2000;
 export const DEFAULT_WARMUP = 100;
-export const DEFAULT_BACKEND: BackendKind = 'webgpu';
 
 /** Model + starting parameters of a preset, for the app's dropdown and the
  *  benchmark's --preset flag. */
 export function resolvePreset(key: string): {
   preset: Preset;
-  model: ModelSpec;
+  model: MModel;
   params: Params;
 } {
   const preset = presets.find((p) => p.key === key);
@@ -58,12 +54,12 @@ export function resolvePreset(key: string): {
       `unknown preset '${key}' (have: ${presets.map((p) => p.key).join(', ')})`,
     );
   }
-  const model = models.find((m) => m.key === preset.modelKey);
+  const model = mModels.find((m) => m.key === preset.modelKey);
   if (!model) throw new Error(`preset '${key}' names unknown model '${preset.modelKey}'`);
   return { preset, model, params: { ...defaultParams(model), ...preset.params } };
 }
 
-export function modelForSpec(spec: RunSpec): ModelSpec {
+export function modelForSpec(spec: RunSpec): MModel {
   return resolvePreset(spec.preset).model;
 }
 
@@ -81,7 +77,6 @@ export function formatCommand(spec: RunSpec): string {
     BENCH_COMMAND,
     `--preset ${spec.preset}`,
     `--lmax ${spec.lmax}`,
-    `--backend ${spec.backend}`,
     `--steps ${spec.steps}`,
     `--seed ${spec.seed}`,
     ...model.params.map((p) => `--${p.key} ${String(spec.params[p.key])}`),
@@ -126,14 +121,9 @@ export function parseArgs(argv: string[]): RunSpec {
 
   const presetKey = take('preset') ?? presets[0].key;
   const { model, params } = resolvePreset(presetKey);
-  const backend = take('backend') ?? DEFAULT_BACKEND;
-  if (backend !== 'webgpu' && backend !== 'cpu') {
-    throw new Error(`--backend must be 'webgpu' or 'cpu' (got '${backend}')`);
-  }
   const spec: RunSpec = {
     preset: presetKey,
     lmax: count('lmax', DEFAULT_LMAX, 1),
-    backend,
     seed: number('seed', DEFAULT_SEED),
     steps: count('steps', DEFAULT_STEPS, 1),
     warmup: count('warmup', DEFAULT_WARMUP, 0),

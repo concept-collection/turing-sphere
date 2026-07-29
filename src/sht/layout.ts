@@ -45,3 +45,15 @@ export function validateConfig(cfg: ShtConfig): void {
 export function isPowerOfTwo(n: number): boolean {
   return n > 0 && (n & (n - 1)) === 0;
 }
+
+/** Grid sizes for a given lmax, dealiased for a reaction of polynomial degree
+ *  `pdeg` (the rule from websph's reference implementation):
+ *  nlat >= ((pdeg+1)*lmax+1)/2, nphi >= (pdeg+1)*lmax+1. nphi is rounded up to
+ *  a power of two to keep the GPU FFT path. */
+export function gridForLmax(lmax: number, pdeg: number): { nlat: number; nphi: number } {
+  const minLat = Math.max(lmax + 1, ((pdeg + 1) * lmax + 1) / 2);
+  const nlat = 2 * Math.ceil(minLat / 2);
+  let nphi = 1;
+  while (nphi < (pdeg + 1) * lmax + 1) nphi *= 2;
+  return { nlat, nphi };
+}
