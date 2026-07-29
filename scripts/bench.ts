@@ -87,11 +87,23 @@ async function installWebGpu(): Promise<string> {
   };
   try {
     mod = await import(specifier);
-  } catch {
+  } catch (e) {
+    // Distinguish "not installed" from "installed but the prebuilt Dawn binary
+    // will not load" — the second is what a machine missing a system library
+    // looks like, and reporting it as the first sends people in circles.
+    const detail = errMsg(e);
+    if (/Cannot find (package|module) '?webgpu'?/.test(detail)) {
+      throw new Error(
+        'desktop WebGPU needs the optional `webgpu` package (prebuilt Google Dawn):\n' +
+          '  npm install webgpu\n' +
+          'It is an optionalDependency, so npm can skip it silently — `npm ls webgpu`\n' +
+          'says whether it is there. Or run with --backend cpu.',
+      );
+    }
     throw new Error(
-      'desktop WebGPU needs the optional `webgpu` package (prebuilt Google Dawn):\n' +
-        '  npm install webgpu\n' +
-        'or run with --backend cpu.',
+      `the \`webgpu\` package is installed but did not load:\n  ${detail}\n` +
+        'That is usually the prebuilt Dawn binary missing a system library.\n' +
+        'Run with --backend cpu for the f64 CPU reference instead.',
     );
   }
   Object.assign(globalThis, mod.globals);
@@ -164,7 +176,14 @@ let adapter = '';
 try {
   if (spec.backend === 'webgpu') {
     runtime = await installWebGpu();
-    device = await requestShtDevice();
+    device = await requestShtDevice().catch((e: unknown) => {
+      throw new Error(
+        `${errMsg(e)}\n` +
+          '  Dawn reaches the GPU through Vulkan on Linux and Windows, Metal on macOS,\n' +
+          "  so a headless box may have no adapter at all. DAWN_FLAGS='backend=vulkan'\n" +
+          '  makes it explain itself; --backend cpu always works.',
+      );
+    });
     adapter = await describeAdapter(device);
     backend = await GpuBackend.create(device, cfg);
   } else {
