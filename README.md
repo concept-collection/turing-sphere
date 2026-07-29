@@ -90,11 +90,13 @@ directly, so `src/` is literally the same code in both places, down to the
 device request in `requestShtDevice()` (Dawn is installed under `navigator.gpu`
 and the WebGPU globals, and the rest runs unchanged).
 
-Desktop WebGPU comes from the optional `webgpu` package (prebuilt Dawn, ~70 MB).
-A plain `npm install` picks it up; `npm install --omit=optional` skips it and
-leaves `--backend cpu` working. Other flags: `--steps`, `--warmup`, `--json`,
-`--help`; `DAWN_FLAGS='backend=vulkan'` (`;`-separated) passes Dawn options
-through, e.g. to pick a backend or compare against Dawn's own software adapter.
+Desktop WebGPU comes from the `webgpu` package (prebuilt Dawn, ~70 MB), listed
+as an optional dependency so that a platform it has no binaries for fails the
+install of that package alone rather than the whole tree. `npm install` picks it
+up; without it, only `--backend cpu` runs and the benchmark says so. Other
+flags: `--steps`, `--warmup`, `--json`, `--help`; `DAWN_FLAGS='backend=vulkan'`
+(`;`-separated) passes Dawn options through, e.g. to pick a backend or to
+compare against Dawn's own software adapter.
 
 What the comparison does and does not control for:
 

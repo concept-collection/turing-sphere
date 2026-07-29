@@ -13,7 +13,7 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - run: npm ci --omit=optional  # skip the prebuilt Dawn binaries; CI does not benchmark
+      - run: npm ci
       - run: npm run test:node
       # headless Chrome + SwiftShader software WebGPU
       - run: npm run test:gpu
