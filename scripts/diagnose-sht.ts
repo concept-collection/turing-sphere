@@ -283,7 +283,9 @@ try {
         `    If only high m are wrong, or only latitudes near the poles where\n` +
           `    sin(theta) is small, the rescaled seed (sinpow_rescaled in\n` +
           `    src/sht/wgsl/common.ts) is the place to look. If every m is wrong by\n` +
-          `    a similar amount, it is indexing or the dispatch, not the recurrence.`,
+          `    a similar amount, it is indexing or the dispatch, not the recurrence.\n` +
+          `    Either way, follow it term by term from here:\n` +
+          `      npx vite-node scripts/diagnose-leg.ts --lmax ${lmax} --m 0`,
       );
     }
     console.log();

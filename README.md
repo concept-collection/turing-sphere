@@ -340,18 +340,35 @@ node scripts/compare-native.mjs --check     # then, from the repo root
 you the CPU comparison anywhere and the GPU one on a machine with an Nvidia card.
 `compare-native.mjs` runs every implementation present, back to back in one
 invocation so a second process competing for the GPU affects both sides rather
-than one, and prints them in one table — here on a machine with no Nvidia card,
-so the CUDA row is missing rather than invented:
+than one, and prints them in one table. On an RTX PRO 6000 Blackwell, at the
+app's default lmax:
 
 ```
   grid lmax 63 · 128×256 · nlm 2,080   (one synthesis + one analysis per round trip)
 
-  webgpu      0.250 ms/round trip   4000/s   (baseline)     fp32
-              Intel open-source Mesa driver: Mesa 25.0.7 (gen-12lp)
-  shtns cuda  not available — bench/shtns/shtbench_gpu is not built
-  shtns cpu   0.110 ms/round trip   9068/s   0.44x webgpu   fp64
+  webgpu      0.084 ms/round trip  11848/s   (baseline)     fp32
+              NVIDIA (blackwell), via Dawn   ·   CPU-side launching 0.012 ms/step
+  shtns cuda  0.021 ms/round trip  48009/s   0.25x webgpu   fp32
+              NVIDIA RTX PRO 6000 (sm_120, 188 SMs)   ·   CPU-side launching 0.018 ms/step
+  shtns cpu   0.072 ms/round trip  13982/s   0.85x webgpu   fp64
               CPU, 1 thread
 ```
+
+Read that carefully rather than as "4x". The two GPU rows are limited by different
+things: the WGSL row spends 14% of its time on the CPU and is genuinely GPU-bound,
+while SHTNS spends **86%** — 0.018 ms of 0.021 — queueing its six-or-so kernels, so
+its number is close to what it costs to *submit* a round trip on that host and its
+actual GPU time is below that and unresolved. The 4x is a lower bound on the gap in
+GPU work, not a measurement of it. `compare-native.mjs` flags any row above 50%
+for this reason.
+
+The other number worth noticing is the third row: one CPU core in fp64 is about
+level with the WGSL transforms on a 188-SM datacentre GPU. At lmax 63 there are
+2,080 coefficients on a 128×256 grid — far too little work to occupy that card, so
+this says more about occupancy than about the shaders. Sweep lmax before drawing
+conclusions, and stop at 511: above that `16*nphi` exceeds the workgroup-storage
+limit, the FFT stage falls back to the O(nphi·mmax) DFT, and the comparison stops
+being about the FFT.
 
 Two things are measured, because they answer different questions:
 
@@ -383,9 +400,8 @@ recurrence in fp64 even in fp32 mode for `lmax <= 128` (WebGPU has no fp64 at
 all), the Fourier stages are cuFFT/VkFFT/FFTW against a WGSL FFT, and SHTNS'
 polar optimization is off by default here because we have none.
 
-One thing worth knowing before reading much into a single number: small grids
-flatter the CPU, because a GPU spends most of a small transform on launch latency
-rather than arithmetic. Run a sweep. On an Intel Xe iGPU against one core of the
+How much the grid size matters is easiest to see on a weak GPU, where there is no
+launch-overhead floor to hide behind. On an Intel Xe iGPU against one core of the
 same laptop, one round trip costs:
 
 | lmax | grid | WGSL (fp32) | SHTNS, 1 CPU core (fp64) |
@@ -454,6 +470,10 @@ Other commands:
   say *which* stage is wrong. It reads the intermediate `fm` back out and scores
   the Legendre and Fourier stages of each direction separately against the f64
   reference, then breaks the error down by order `m` and by latitude.
+- `npx vite-node scripts/diagnose-leg.ts [--m 0]` — the follow-up to that: read the
+  Legendre recurrence out of the production shader term by term, by synthesizing a
+  spectrum that is 1 at a single coefficient, and compare each `ỹ_l^m` with the f64
+  reference. The first term that disagrees names the culprit.
 - `npx vite-node scripts/longrun-node.ts [lmax]` — run to t = 100 and confirm the
   pattern saturates into O(1)-contrast spots rather than decaying or diverging.
 - `node scripts/soak.mjs [steps] [lmax]` — drive the demo for many steps,
@@ -483,6 +503,36 @@ reflowed the panel, fired the `ResizeObserver`, and called
 `canvas.width` also blanks the canvas even when the value is unchanged, so the
 same bug caused visible flicker. Fixed by giving the colorbar column a fixed
 width and making `SphereScene.resize()` return early on no-op resizes.
+
+### A note on the Legendre recurrence on Blackwell
+
+The first run on an Nvidia GPU — an RTX PRO 6000, driver 590.48, reached through
+Dawn's Vulkan backend — failed 11 of the tests. `synth` was off by 5.5e+3 while
+`analys` was accurate to 7.3e-7, and the solver produced NaN within 40 steps.
+
+The two diagnostic scripts above were written for it and localized it in two
+steps: `leg_synth` was the only wrong shader, and within it the recurrence was
+right at `l = m` and `l = m+1` and then returned *exactly zero* at `l = m+2`, at
+every latitude. That is not a precision failure. It is
+
+```wgsl
+let c0 = ab[base + (l + 2u - m)];
+y0 = c0.x * ct * y1 + c0.y * y0;      // c0 reads as (0, 0) on the first iteration
+```
+
+with the `ab` read two lines later working fine. The buffer was not at fault:
+`leg_analys` reads the same array correctly on the same device, and `m = 62, 63`
+— the only orders whose loop breaks before that line — were the only correct
+ones. Nothing about that WGSL is invalid, so it was a miscompiled load.
+
+Fixed by giving the advance the shape `leg_analys` already used, which that
+driver compiles correctly: both coefficients fetched unconditionally, and the new
+`y0` carried in a temporary rather than assigned and then read back by the `y1`
+update. Two shaders doing the same recurrence should have agreed on form anyway.
+
+Worth knowing for what it says about the transforms in general: nothing had
+exercised them on Nvidia hardware before, and the existing test caught it
+immediately — it just could not say where. That is what the diagnostics are for.
 
 ## Development
 

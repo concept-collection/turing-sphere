@@ -13,7 +13,7 @@ import type { Assign, IRExpr, IRStmt } from 'numbl-src/numbl-core/jit/lowering/i
 import type { NumericType, Type } from 'numbl-src/numbl-core/jit/lowering/types.ts';
 import { ShtPlan, type ShtBinding } from '../sht/sht.ts';
 import type { CompiledFunction } from './compile.ts';
-import { EXTERNAL_OPS, type GridSizes } from './externals.ts';
+import { EXTERNAL_OPS } from './externals.ts';
 import {
   buildKernel,
   UnsupportedOnGpu,

@@ -34,7 +34,9 @@ endif
 all: $(TARGETS)
 	@echo
 	@echo "built: $(TARGETS)"
-ifneq ($(SHTNS_HAS_GPU),1)
+ifeq ($(SHTNS_HAS_GPU),1)
+	@echo "SHTNS GPU Fourier stage: $(SHTNS_GPU_FFT)$(if $(filter cufft,$(SHTNS_GPU_FFT)), — theta-contiguous only; --layout phi needs VkFFT,)"
+else
 	@echo "note: SHTNS was built without GPU support, so there is no shtbench_gpu."
 	@echo "      Re-run ./bootstrap.sh on a machine with nvcc to get it."
 endif

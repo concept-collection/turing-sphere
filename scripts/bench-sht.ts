@@ -219,6 +219,22 @@ try {
   };
   const done = (): Promise<undefined> => device!.queue.onSubmittedWorkDone();
 
+  // What every report of this run says about itself, whether it succeeded, failed
+  // early, or is being written to a state file for compare-native.mjs to diff.
+  const identity = {
+    mode: 'transform',
+    spec: {
+      preset: spec.preset,
+      lmax: spec.lmax,
+      seed: spec.seed,
+      steps: spec.steps,
+      warmup: spec.warmup,
+    },
+    backend: { library: 'shtns-webgpu (src/sht)', runtime, adapter, precision: 'fp32' },
+    grid: { lmax: cfg.lmax, nlat: cfg.nlat, nphi: cfg.nphi, nlm },
+    fourier: plan.fourierMode,
+  };
+
   if (!wantJson) {
     console.log('turing-sphere bench:sht — transforms only, no solver, no rendering\n');
     console.log(
@@ -269,11 +285,7 @@ try {
       console.log(
         JSON.stringify(
           {
-            mode: 'transform',
-            spec: { preset: spec.preset, lmax: spec.lmax, seed: spec.seed, steps: spec.steps, warmup: spec.warmup },
-            backend: { library: 'shtns-webgpu (src/sht)', runtime, adapter, precision: 'fp32' },
-            grid: { lmax: cfg.lmax, nlat: cfg.nlat, nphi: cfg.nphi, nlm },
-            fourier: plan.fourierMode,
+            ...identity,
             firstRoundTrip: { finite: firstFinite, relL2: firstRelL2 },
             throughput: null,
             latency: null,
@@ -373,11 +385,7 @@ try {
     console.log(
       JSON.stringify(
         {
-          mode: 'transform',
-          spec: { preset: spec.preset, lmax: spec.lmax, seed: spec.seed, steps: spec.steps, warmup: spec.warmup },
-          backend: { library: 'shtns-webgpu (src/sht)', runtime, adapter, precision: 'fp32' },
-          grid: { lmax: cfg.lmax, nlat: cfg.nlat, nphi: cfg.nphi, nlm },
-          fourier: plan.fourierMode,
+          ...identity,
           firstRoundTrip: { finite: firstFinite, relL2: firstRelL2 },
           throughput: {
             batch,
@@ -424,9 +432,7 @@ try {
     writeFileSync(
       dumpState,
       JSON.stringify({
-        mode: 'transform',
-        spec: { preset: spec.preset, lmax: spec.lmax, seed: spec.seed, steps: spec.steps, warmup: spec.warmup },
-        backend: { library: 'shtns-webgpu (src/sht)', adapter, precision: 'fp32' },
+        ...identity,
         digest,
         input: inputDigest,
         state: [...state],
