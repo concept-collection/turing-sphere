@@ -13,6 +13,8 @@ import { legSynthWGSL, legAnalysWGSL } from './wgsl/leg.ts';
 import {
   fftSynthWGSL,
   fftAnalysWGSL,
+  fftSynthRealWGSL,
+  fftAnalysRealWGSL,
   dftSynthWGSL,
   dftAnalysWGSL,
   fftThreads,
@@ -238,18 +240,27 @@ export class ShtPlan {
       parity,
     };
     (this as { legLat: number }).legLat = parity ? nlat / 2 : nlat;
-    const fourP = { mmax, nlat, nphi };
+    const fourP = { mmax, nlat, nphi, radix: (tuning('SHT_RADIX') as number | undefined) ?? 4 };
+    // The spatial field is real (layout.ts stores m >= 0 only), so the Fourier
+    // stage can run an nphi/2-point complex FFT plus a recombination instead of
+    // a full nphi-point one: half the arithmetic and half the workgroup storage.
+    // The complex kernels remain for a future complex-valued field, and are what
+    // SHT_REAL_FFT=0 selects.
+    const realFft =
+      this.fourierMode === 'fft' && nphi % 2 === 0 && tuning('SHT_REAL_FFT') !== false;
+    const fftS = realFft ? fftSynthRealWGSL : fftSynthWGSL;
+    const fftA = realFft ? fftAnalysRealWGSL : fftAnalysWGSL;
     const [pLegS, pLegA, pFourS, pFourA] = await Promise.all([
       makePipeline(dev, legSynthWGSL(legP), 'leg_synth'),
       makePipeline(dev, legAnalysWGSL(legP), 'leg_analys'),
       makePipeline(
         dev,
-        this.fourierMode === 'fft' ? fftSynthWGSL(fourP) : dftSynthWGSL(fourP),
+        this.fourierMode === 'fft' ? fftS(fourP) : dftSynthWGSL(fourP),
         this.fourierMode === 'fft' ? 'fft_synth' : 'dft_synth',
       ),
       makePipeline(
         dev,
-        this.fourierMode === 'fft' ? fftAnalysWGSL(fourP) : dftAnalysWGSL(fourP),
+        this.fourierMode === 'fft' ? fftA(fourP) : dftAnalysWGSL(fourP),
         this.fourierMode === 'fft' ? 'fft_analys' : 'dft_analys',
       ),
     ]);
@@ -348,6 +359,47 @@ export class ShtPlan {
     pass.end();
   }
 
+  /**
+   * Diagnostics: encode one stage alone, in its own pass, so a timestamp query
+   * can measure just that kernel. The solver wants both stages in a shared pass
+   * and should use encodeSynthInto/encodeAnalysInto; this exists because
+   * inferring per-kernel cost by subtracting trivially-sized runs is unreliable.
+   */
+  encodeStage(
+    encoder: GPUCommandEncoder,
+    stage: 'legSynth' | 'fourSynth' | 'fourAnalys' | 'legAnalys',
+    timestampWrites?: GPUComputePassTimestampWrites,
+  ): void {
+    const { mmax, nlat, nphi } = this.cfg;
+    const fft = this.fourierMode === 'fft';
+    const pass = encoder.beginComputePass({ label: `sht-${stage}`, timestampWrites });
+    switch (stage) {
+      case 'legSynth':
+        pass.setPipeline(this.pipeLegSynth);
+        pass.setBindGroup(0, this.bgLegSynth);
+        pass.dispatchWorkgroups(Math.ceil(this.legLat / WG_SYNTH), mmax + 1);
+        break;
+      case 'fourSynth':
+        pass.setPipeline(this.pipeFourSynth);
+        pass.setBindGroup(0, this.bgFourSynth);
+        if (fft) pass.dispatchWorkgroups(nlat);
+        else pass.dispatchWorkgroups(Math.ceil(nphi / 64), nlat);
+        break;
+      case 'fourAnalys':
+        pass.setPipeline(this.pipeFourAnalys);
+        pass.setBindGroup(0, this.bgFourAnalys);
+        if (fft) pass.dispatchWorkgroups(nlat);
+        else pass.dispatchWorkgroups(Math.ceil((mmax + 1) / 64), nlat);
+        break;
+      case 'legAnalys':
+        pass.setPipeline(this.pipeLegAnalys);
+        pass.setBindGroup(0, this.bgLegAnalys);
+        pass.dispatchWorkgroups(mmax + 1);
+        break;
+    }
+    pass.end();
+  }
+
   /** Record the analysis (spatial spatBuf -> spectral qlmOut) into an encoder. */
   encodeAnalys(encoder: GPUCommandEncoder): void {
     const pass = encoder.beginComputePass({ label: 'sht-analys' });
@@ -429,7 +481,11 @@ export async function requestShtDevice(): Promise<GPUDevice> {
   // `subgroups` lets the analysis reduction use subgroupAdd instead of a
   // shared-memory tree (2 barriers per l-pair instead of 1 + log2(wgAnalys)).
   // Optional: ShtPlan falls back to the tree when it is not available.
-  const features: GPUFeatureName[] = adapter.features.has('subgroups') ? ['subgroups'] : [];
+  const features: GPUFeatureName[] = [];
+  if (adapter.features.has('subgroups')) features.push('subgroups');
+  // timestamp-query is only used by the profiling scripts, but it has to be
+  // requested at device creation, and asking costs nothing when unused.
+  if (adapter.features.has('timestamp-query')) features.push('timestamp-query');
   return adapter.requestDevice({
     requiredFeatures: features,
     requiredLimits: { maxComputeWorkgroupStorageSize: wgStorage },
