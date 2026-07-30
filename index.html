@@ -211,6 +211,15 @@
             <option value="20">20×</option>
           </select>
         </label>
+        <label title="Rendered size of each sphere panel, in pixels — the video frame is the panels side by side plus the caption. Independent of the window size.">resolution
+          <select id="movieres">
+            <option value="480">480</option>
+            <option value="640">640</option>
+            <option value="768" selected>768</option>
+            <option value="1080">1080</option>
+            <option value="1440">1440</option>
+          </select>
+        </label>
         <label title="Slowly orbit the camera during the movie — one revolution per 2 minutes of video, starting from the current view (which is restored afterwards)">
           <input type="checkbox" id="movierotate" checked /> auto-rotate
         </label>

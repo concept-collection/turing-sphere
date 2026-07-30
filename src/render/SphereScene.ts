@@ -223,6 +223,31 @@ export class SphereScene {
     this.#needsRender = true;
   }
 
+  /**
+   * Set the drawing buffer to an exact square pixel size, independent of the
+   * container and devicePixelRatio — for capturing at a chosen resolution.
+   * The canvas keeps its CSS sizing, so on screen it just rescales. Undo with
+   * restoreSize().
+   */
+  captureSize(px: number): void {
+    this.#renderer.setPixelRatio(1);
+    this.#renderer.setSize(px, px, false);
+    this.#camera.aspect = 1;
+    this.#camera.updateProjectionMatrix();
+    this.#needsRender = true;
+  }
+
+  /** Return from captureSize() to the container-driven buffer size. */
+  restoreSize(): void {
+    this.#renderer.setPixelRatio(window.devicePixelRatio || 1);
+    if (this.#lastW > 0 && this.#lastH > 0) {
+      this.#renderer.setSize(this.#lastW, this.#lastH, false);
+      this.#camera.aspect = this.#lastW / Math.max(1, this.#lastH);
+      this.#camera.updateProjectionMatrix();
+    }
+    this.#needsRender = true;
+  }
+
   dispose(): void {
     if (this.#animationId !== null) {
       cancelAnimationFrame(this.#animationId);

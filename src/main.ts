@@ -37,6 +37,7 @@ const elResetView = $<HTMLButtonElement>('resetview');
 const elMovieToggle = $<HTMLButtonElement>('movietoggle');
 const elMovieBar = $('moviebar');
 const elMovieSpeed = $<HTMLSelectElement>('moviespeed');
+const elMovieRes = $<HTMLSelectElement>('movieres');
 const elMovieRotate = $<HTMLInputElement>('movierotate');
 const elMovie = $<HTMLButtonElement>('movie');
 const elParams = $('params');
@@ -643,7 +644,8 @@ function submitSteps(n: number): void {
 function setMovieUi(on: boolean): void {
   const locked = [
     elModel, elLmax, elOversample, elColormap, elRunPause, elBenchmark,
-    elReseed, elRecompile, elRevert, elMovieSpeed, elMovieRotate, elMovieToggle,
+    elReseed, elRecompile, elRevert, elMovieSpeed, elMovieRes, elMovieRotate,
+    elMovieToggle,
   ];
   for (const el of locked) el.disabled = on;
   elParams.querySelectorAll('input').forEach((input) => (input.disabled = on));
@@ -688,8 +690,12 @@ async function recordMovie(): Promise<void> {
     if (gen !== generation || !session) return;
     total = session.steps;
     const speed = Number(elMovieSpeed.value) || 10;
+    const sphere = Number(elMovieRes.value) || 768;
     const rotate = elMovieRotate.checked;
     if (rotate) camBefore = scenes[0]?.cameraState();
+    // Render the scenes at exactly the chosen resolution for the recording —
+    // independent of the window size — and restore afterwards.
+    for (const s of scenes) s.captureSize(sphere);
     const durationS = Math.max(session.t / speed, 2 / MOVIE_FPS);
     const frames = Math.max(
       2,
@@ -710,6 +716,7 @@ async function recordMovie(): Promise<void> {
       subtitle,
       speed,
       fps: (frames - 1) / durationS,
+      sphere,
     });
 
     let finished = false;
@@ -774,6 +781,9 @@ async function recordMovie(): Promise<void> {
       }
       await draw();
       updateStats();
+    }
+    if (gen === generation) {
+      for (const s of scenes) s.restoreSize();
     }
     if (camBefore && gen === generation) {
       for (const s of scenes) s.setCameraState(camBefore);

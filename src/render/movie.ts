@@ -41,14 +41,21 @@ export interface MovieOptions {
   speed: number;
   /** Effective frames per second, for encoder rate control only. */
   fps: number;
+  /** Rendered edge of each sphere panel, px. The caller renders the scene
+   *  canvases at this size; the frame is the panels side by side plus the
+   *  caption bar. */
+  sphere: number;
 }
 
 /**
- * H.264 at level 4.0 (enough for 1080p30, which the layout stays under):
- * High profile, then Main, then Constrained Baseline — Chrome's software
- * fallback encoder supports only the last.
+ * H.264 profile candidates: High, then Main, then Constrained Baseline —
+ * Chrome's software fallback encoder supports only the last. The level covers
+ * the frame area: 4.0 up to 1080p at 30 fps, 5.1 beyond (large exports).
  */
-const H264_CANDIDATES = ['avc1.640028', 'avc1.4d0028', 'avc1.42e028'];
+const h264Candidates = (pixels: number): string[] => {
+  const level = pixels <= 1920 * 1080 ? '28' : '33';
+  return ['avc1.6400', 'avc1.4d00', 'avc1.42e0'].map((p) => p + level);
+};
 
 const even = (x: number): number => 2 * Math.floor(x / 2);
 
@@ -63,12 +70,10 @@ interface Layout {
   height: number;
 }
 
-/** Sized from the live canvases: the movie matches what is on screen, capped
- *  so the H.264 level and file size stay reasonable. Even dimensions, as
- *  4:2:0 encoders require. */
-const layoutFor = (panels: MoviePanel[]): Layout => {
-  const src = Math.min(...panels.map((p) => p.canvas.width));
-  const sphere = even(Math.max(240, Math.min(768, src)));
+/** Sized from the caller's resolution choice, clamped to what H.264 encoders
+ *  comfortably handle. Even dimensions, as 4:2:0 encoders require. */
+const layoutFor = (nPanels: number, spherePx: number): Layout => {
+  const sphere = even(Math.max(240, Math.min(1600, spherePx)));
   const u = sphere / 768;
   const gutter = even(Math.round(72 * u));
   const captionH = even(Math.round(64 * u));
@@ -77,7 +82,7 @@ const layoutFor = (panels: MoviePanel[]): Layout => {
     u,
     gutter,
     captionH,
-    width: panels.length * (sphere + gutter),
+    width: nPanels * (sphere + gutter),
     height: sphere + captionH,
   };
 };
@@ -107,19 +112,19 @@ export class MovieRecorder {
     if (typeof VideoEncoder === 'undefined') {
       throw new Error('WebCodecs is not available in this browser');
     }
-    const layout = layoutFor(opts.panels);
+    const layout = layoutFor(opts.panels.length, opts.sphere);
     const fps = Math.max(1, Math.round(opts.fps));
     const config = {
       width: layout.width,
       height: layout.height,
       // ~0.15 bits per pixel per frame reads as visually lossless here
       bitrate: Math.min(
-        12e6,
+        24e6,
         Math.max(2e6, Math.round(layout.width * layout.height * fps * 0.15)),
       ),
       framerate: fps,
     };
-    for (const codec of H264_CANDIDATES) {
+    for (const codec of h264Candidates(layout.width * layout.height)) {
       const { supported } = await VideoEncoder.isConfigSupported({ codec, ...config });
       if (supported) return new MovieRecorder(opts, layout, { codec, ...config });
     }
