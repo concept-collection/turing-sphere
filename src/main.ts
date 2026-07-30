@@ -19,8 +19,9 @@ import {
   type SphereMeshTopology,
 } from './render/sphereMesh.ts';
 import { SphereScene } from './render/SphereScene.ts';
-import { Colorbar } from './render/colorbar.ts';
+import { Colorbar, fmtValue } from './render/colorbar.ts';
 import { colormaps, colormapNames } from './render/colormaps.ts';
+import { MovieRecorder } from './render/movie.ts';
 
 const $ = <T extends HTMLElement>(id: string): T =>
   document.getElementById(id) as T;
@@ -33,6 +34,12 @@ const elRunPause = $<HTMLButtonElement>('runpause');
 const elBenchmark = $<HTMLButtonElement>('benchmark');
 const elReseed = $<HTMLButtonElement>('reseed');
 const elResetView = $<HTMLButtonElement>('resetview');
+const elMovieToggle = $<HTMLButtonElement>('movietoggle');
+const elMovieBar = $('moviebar');
+const elMovieSpeed = $<HTMLSelectElement>('moviespeed');
+const elMovieRes = $<HTMLSelectElement>('movieres');
+const elMovieRotate = $<HTMLInputElement>('movierotate');
+const elMovie = $<HTMLButtonElement>('movie');
 const elParams = $('params');
 const elPanels = $('panels');
 const elStats = $('stats');
@@ -110,6 +117,22 @@ function resolveOversample(): number {
   return os;
 }
 
+/**
+ * Movie frame rate, and a cap on frames per movie. Playback speed comes from
+ * the UI, in simulation-time units per second of video; the movie's length is
+ * the run's t at that speed, and the frame count follows from it — capped by
+ * the run's own step count (a step is at most one frame) and by
+ * MOVIE_MAX_FRAMES to bound encode time and file size. Frame timestamps are
+ * derived from simulation time, so a capped movie keeps its duration and
+ * speed exactly, at a lower effective frame rate.
+ */
+const MOVIE_FPS = 30;
+const MOVIE_MAX_FRAMES = 3600;
+
+/** Movie auto-rotation: camera revolutions per second of video. Measured in
+ *  video time, so the orbit pace on screen is the same at every export speed. */
+const MOVIE_ROTATE_RPS = 1 / 120;
+
 // ---------------------------------------------------------------- state
 let device: GPUDevice | null = null;
 let session: ModelSession | null = null;
@@ -130,6 +153,8 @@ let seed = 1;
 let running = false;
 let adapterName = '';
 let pumping = false;
+let movieBusy = false;
+let movieCancel = false;
 let solverMs = 0;
 let frameMs = 0;
 let lastMeasure = 0;
@@ -225,6 +250,13 @@ elReseed.addEventListener('click', () => {
 });
 elResetView.addEventListener('click', () => {
   for (const s of scenes) s.resetCamera();
+});
+elMovieToggle.addEventListener('click', () => {
+  elMovieBar.hidden = !elMovieBar.hidden;
+});
+elMovie.addEventListener('click', () => {
+  if (movieBusy) movieCancel = true;
+  else void recordMovie();
 });
 
 elRecompile.addEventListener('click', () => {
@@ -545,40 +577,221 @@ async function pump(): Promise<void> {
  * These are ordinary steps: the simulation advances by them.
  */
 async function benchmark(): Promise<void> {
-  if (!session) return;
+  if (!session || movieBusy) return;
   setRunning(false);
   const BATCH = 32;
   const DURATION_MS = 2000;
   elBenchResult.textContent = 'benchmarking…';
-  await nextFrame();
+  // A movie started mid-benchmark would replay while this loop still steps.
+  elMovie.disabled = true;
+  try {
+    await nextFrame();
 
-  const gen = generation;
-  const perStep: number[] = [];
-  const t0 = performance.now();
-  while (performance.now() - t0 < DURATION_MS) {
-    const b0 = performance.now();
-    session.step(BATCH);
-    await session.sync();
-    if (gen !== generation) return;
-    perStep.push((performance.now() - b0) / BATCH);
+    const gen = generation;
+    const perStep: number[] = [];
+    const t0 = performance.now();
+    while (performance.now() - t0 < DURATION_MS) {
+      const b0 = performance.now();
+      session.step(BATCH);
+      await session.sync();
+      if (gen !== generation) return;
+      perStep.push((performance.now() - b0) / BATCH);
+    }
+
+    const mean = (xs: number[]): number => xs.reduce((a, b) => a + b, 0) / xs.length;
+    const all = mean(perStep);
+    const best = Math.min(...perStep);
+    const third = Math.max(1, Math.floor(perStep.length / 3));
+    const first = mean(perStep.slice(0, third));
+    const last = mean(perStep.slice(-third));
+    const steps = perStep.length * BATCH;
+
+    elBenchResult.innerHTML =
+      `sustained solver: <b>${all.toFixed(2)} ms/step</b> ` +
+      `(${(1000 / all).toFixed(0)} steps/s) · best ${best.toFixed(2)} · ` +
+      `ramp ${(first / last).toFixed(2)}× (${first.toFixed(2)} → ${last.toFixed(2)}) · ` +
+      `${steps} steps in batches of ${BATCH} · ` +
+      `compare with <code>npm run bench -- --lmax ${session.cfg.lmax}</code>`;
+    await draw();
+    updateStats();
+  } finally {
+    elMovie.disabled = false;
   }
+}
 
-  const mean = (xs: number[]): number => xs.reduce((a, b) => a + b, 0) / xs.length;
-  const all = mean(perStep);
-  const best = Math.min(...perStep);
-  const third = Math.max(1, Math.floor(perStep.length / 3));
-  const first = mean(perStep.slice(0, third));
-  const last = mean(perStep.slice(-third));
-  const steps = perStep.length * BATCH;
+// ---------------------------------------------------------------- movie
+function saveBlob(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
+}
 
-  elBenchResult.innerHTML =
-    `sustained solver: <b>${all.toFixed(2)} ms/step</b> ` +
-    `(${(1000 / all).toFixed(0)} steps/s) · best ${best.toFixed(2)} · ` +
-    `ramp ${(first / last).toFixed(2)}× (${first.toFixed(2)} → ${last.toFixed(2)}) · ` +
-    `${steps} steps in batches of ${BATCH} · ` +
-    `compare with <code>npm run bench -- --lmax ${session.cfg.lmax}</code>`;
-  await draw();
-  updateStats();
+/** Submit `n` steps in bounded command buffers — a single buffer encoding
+ *  many thousands of steps can exhaust the encoder. */
+function submitSteps(n: number): void {
+  while (n > 0 && session) {
+    const chunk = Math.min(512, n);
+    session.step(chunk);
+    n -= chunk;
+  }
+}
+
+/** While recording, lock everything that could change the run mid-replay;
+ *  the Movie button itself becomes the cancel button. */
+function setMovieUi(on: boolean): void {
+  const locked = [
+    elModel, elLmax, elOversample, elColormap, elRunPause, elBenchmark,
+    elReseed, elRecompile, elRevert, elMovieSpeed, elMovieRes, elMovieRotate,
+    elMovieToggle,
+  ];
+  for (const el of locked) el.disabled = on;
+  elParams.querySelectorAll('input').forEach((input) => (input.disabled = on));
+  elMovie.textContent = on ? 'Cancel · 0%' : 'Export';
+}
+
+/**
+ * Recompute the run from t = 0 and download it as an MP4.
+ *
+ * The movie is not a recording of what already happened — it is the same
+ * trajectory recomputed: same seed, same source, and the *current* parameters
+ * and colormap throughout. Determinism makes this exact: after the replay the
+ * state is where it was, so the one session is reused and the app resumes as
+ * if nothing happened. Frames are composited from the live panels, so the
+ * movie shows the spheres at the current camera orientation — and the replay
+ * doubles as the progress display, since it is visible on screen.
+ */
+async function recordMovie(): Promise<void> {
+  if (!session || movieBusy) return;
+  if (session.steps === 0) {
+    elMovie.textContent = 'run first';
+    setTimeout(() => (elMovie.textContent = 'Export'), 1200);
+    return;
+  }
+  movieBusy = true;
+  movieCancel = false;
+  const gen = generation;
+  setMovieUi(true);
+  let wasRunning = false;
+  let total = 0;
+  let done = 0;
+  let seeded = false;
+  let camBefore: ReturnType<SphereScene['cameraState']> | undefined;
+  try {
+    // An in-flight display-grid swap replaces the scenes whose canvases the
+    // recorder captures, and resumes the run when it lands — let it finish.
+    await viewChange;
+    if (gen !== generation || !session) return;
+    wasRunning = running;
+    setRunning(false);
+    while (pumping) await nextFrame(); // let an in-flight live frame drain
+    if (gen !== generation || !session) return;
+    total = session.steps;
+    const speed = Number(elMovieSpeed.value) || 10;
+    const sphere = Number(elMovieRes.value) || 768;
+    const rotate = elMovieRotate.checked;
+    if (rotate) camBefore = scenes[0]?.cameraState();
+    // Render the scenes at exactly the chosen resolution for the recording —
+    // independent of the window size — and restore afterwards.
+    for (const s of scenes) s.captureSize(sphere);
+    const durationS = Math.max(session.t / speed, 2 / MOVIE_FPS);
+    const frames = Math.max(
+      2,
+      Math.min(Math.round(durationS * MOVIE_FPS) + 1, total + 1, MOVIE_MAX_FRAMES),
+    );
+    /** The step index captured as frame `i`; both endpoints land exactly. */
+    const stepAt = (i: number): number => Math.round((i * total) / (frames - 1));
+
+    const title =
+      (presets.find((p) => p.key === elModel.value)?.label ?? model.label) +
+      (editedSource !== null ? ' (edited)' : '');
+    const subtitle = model.params
+      .map((spec) => `${spec.label} ${fmtValue(params[spec.key])}`)
+      .join(' · ');
+    const rec = await MovieRecorder.create({
+      panels: model.species.map((label, k) => ({ canvas: scenes[k].canvas, label })),
+      title,
+      subtitle,
+      speed,
+      fps: (frames - 1) / durationS,
+      sphere,
+    });
+
+    let finished = false;
+    try {
+      // Reset the color-range smoothing as a re-seed does, so the shading
+      // evolves in the movie the way it did live.
+      session.seed(seed);
+      seeded = true;
+      for (const r of ranges) {
+        r.lo = NaN;
+        r.hi = NaN;
+      }
+      const cmap = colormaps[elColormap.value] ?? colormaps.viridis;
+      let lastVideoS = 0;
+      for (let frame = 0; ; ) {
+        await draw();
+        if (gen !== generation) return;
+        if (movieCancel) break;
+        if (rotate) {
+          // Advance the orbit by this frame's share of video time; siblings
+          // follow scenes[0] through the usual camera sync.
+          const videoS = session.t / speed;
+          scenes[0]?.orbitBy(2 * Math.PI * MOVIE_ROTATE_RPS * (videoS - lastVideoS));
+          lastVideoS = videoS;
+        }
+        for (const s of scenes) s.renderNow();
+        await rec.addFrame(
+          session.t,
+          model.species.map((_, k) => ({ cmap, lo: ranges[k].lo, hi: ranges[k].hi })),
+        );
+        if (++frame >= frames) {
+          finished = true;
+          break;
+        }
+        const target = stepAt(frame);
+        submitSteps(target - done);
+        done = target;
+        elMovie.textContent = `Cancel · ${Math.round((100 * done) / total)}%`;
+      }
+      if (finished) {
+        const blob = await rec.finish();
+        saveBlob(
+          blob,
+          `turing-sphere-${model.key}-t${session.t.toFixed(2)}-${speed}x.mp4`,
+        );
+      }
+    } finally {
+      if (!finished) rec.cancel();
+    }
+  } catch (e) {
+    elErr.textContent = `movie: ${e instanceof Error ? e.message : e}`;
+  } finally {
+    // A cancelled replay stopped short of where the run was; step the
+    // remainder — determinism makes this land exactly there.
+    if (seeded && gen === generation && session) {
+      while (done < total && gen === generation && session) {
+        const n = Math.min(4096, total - done);
+        submitSteps(n);
+        done += n;
+        elMovie.textContent = `restoring · ${Math.round((100 * done) / total)}%`;
+        await session.sync();
+      }
+      await draw();
+      updateStats();
+    }
+    if (gen === generation) {
+      for (const s of scenes) s.restoreSize();
+    }
+    if (camBefore && gen === generation) {
+      for (const s of scenes) s.setCameraState(camBefore);
+    }
+    movieBusy = false;
+    setMovieUi(false);
+    if (gen === generation) setRunning(wasRunning);
+  }
 }
 
 // ---------------------------------------------------------------- boot

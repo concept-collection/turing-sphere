@@ -107,6 +107,21 @@ export class SphereScene {
     this.#needsRender = true;
   }
 
+  /** The renderer's canvas, for capturing frames. */
+  get canvas(): HTMLCanvasElement {
+    return this.#renderer.domElement;
+  }
+
+  /**
+   * Render immediately, outside the animation loop. A WebGL canvas without
+   * preserveDrawingBuffer keeps its drawing buffer only until the browser next
+   * composites, so a capturer must render and copy within one task.
+   */
+  renderNow(): void {
+    this.#needsRender = false;
+    this.#renderer.render(this.#scene, this.#camera);
+  }
+
   /** Mirror this scene's camera whenever the other scene's controls move. */
   syncCamerasWith(other: SphereScene): void {
     const follow = (src: SphereScene, dst: SphereScene) => {
@@ -124,6 +139,16 @@ export class SphereScene {
     };
     follow(this, other);
     follow(other, this);
+  }
+
+  /** Orbit the camera about the up axis by `angle` radians, keeping the
+   *  target. Synced sibling scenes follow via their controls, as with a drag. */
+  orbitBy(angle: number): void {
+    const offset = this.#camera.position.clone().sub(this.#controls.target);
+    offset.applyAxisAngle(this.#camera.up, angle);
+    this.#camera.position.copy(this.#controls.target).add(offset);
+    this.#controls.update();
+    this.#needsRender = true;
   }
 
   /** Camera pose, for carrying the view across a scene rebuild. */
@@ -195,6 +220,31 @@ export class SphereScene {
     this.#renderer.setSize(width, height, false);
     // setSize clears the drawing buffer, so a re-render is required even
     // though nothing in the scene moved
+    this.#needsRender = true;
+  }
+
+  /**
+   * Set the drawing buffer to an exact square pixel size, independent of the
+   * container and devicePixelRatio — for capturing at a chosen resolution.
+   * The canvas keeps its CSS sizing, so on screen it just rescales. Undo with
+   * restoreSize().
+   */
+  captureSize(px: number): void {
+    this.#renderer.setPixelRatio(1);
+    this.#renderer.setSize(px, px, false);
+    this.#camera.aspect = 1;
+    this.#camera.updateProjectionMatrix();
+    this.#needsRender = true;
+  }
+
+  /** Return from captureSize() to the container-driven buffer size. */
+  restoreSize(): void {
+    this.#renderer.setPixelRatio(window.devicePixelRatio || 1);
+    if (this.#lastW > 0 && this.#lastH > 0) {
+      this.#renderer.setSize(this.#lastW, this.#lastH, false);
+      this.#camera.aspect = this.#lastW / Math.max(1, this.#lastH);
+      this.#camera.updateProjectionMatrix();
+    }
     this.#needsRender = true;
   }
 

@@ -32,10 +32,11 @@ U_k  = (U_k + dt*R_k) / (1 + dt*D_k*l(l+1))
 
 You watch the patterns emerge in real time on orbitable 3D spheres (one per
 species, cameras synced), with pause/resume, re-seeding, live parameter editing,
-and colormap selection. The display can oversample the solver — the state is
-spectral, so evaluating it on a finer grid for rendering is exact
-interpolation, not smoothing. This never touches the solver or its grid; by
-default it turns on only when the solver grid is coarse.
+colormap selection, and movie download — the run is recomputed from t = 0 and
+encoded to a captioned MP4 in the browser (WebCodecs). The display can
+oversample the solver — the state is spectral, so evaluating it on a finer grid
+for rendering is exact interpolation, not smoothing. This never touches the
+solver or its grid; by default it turns on only when the solver grid is coarse.
 
 Three models are included, one `.m` file each:
 

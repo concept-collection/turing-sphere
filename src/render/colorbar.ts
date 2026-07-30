@@ -1,5 +1,9 @@
 import type { ColormapFunc } from './colormaps.ts';
 
+/** Compact numeric label: 3 significant digits, trailing zeros trimmed. */
+export const fmtValue = (v: number): string =>
+  Number.isFinite(v) ? v.toPrecision(3).replace(/\.?0+$/, '') : '—';
+
 /** Vertical colorbar drawn on a small canvas, with min/max labels. */
 export class Colorbar {
   #canvas: HTMLCanvasElement;
@@ -28,9 +32,7 @@ export class Colorbar {
       ctx.fillStyle = `rgb(${r},${g},${b})`;
       ctx.fillRect(0, y, this.#canvas.width, 1);
     }
-    const fmt = (v: number) =>
-      Number.isFinite(v) ? v.toPrecision(3).replace(/\.?0+$/, '') : '—';
-    this.#maxLabel.textContent = fmt(vmax);
-    this.#minLabel.textContent = fmt(vmin);
+    this.#maxLabel.textContent = fmtValue(vmax);
+    this.#minLabel.textContent = fmtValue(vmin);
   }
 }
