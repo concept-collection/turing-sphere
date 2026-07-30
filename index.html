@@ -180,6 +180,14 @@
             <option value="255">255</option>
           </select>
         </label>
+        <label title="Display only — the solution is evaluated on a finer grid for rendering; the solver and its grid are unchanged. Auto oversamples coarse grids and leaves fine ones alone.">display oversampling
+          <select id="oversample">
+            <option value="auto" selected>auto</option>
+            <option value="1">off</option>
+            <option value="2">2×</option>
+            <option value="4">4×</option>
+          </select>
+        </label>
         <label>colormap
           <select id="colormap"></select>
         </label>

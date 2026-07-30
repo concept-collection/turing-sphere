@@ -1,4 +1,5 @@
 import { requestShtDevice, describeAdapter } from './sht/sht.ts';
+import { gridForLmax } from './sht/layout.ts';
 import { ModelSession } from './mgpu/session.ts';
 import { mModelByKey, presets, type MModel, type Params } from './mgpu/registry.ts';
 import { ModelCompileError, formatFailure } from './mgpu/errors.ts';
@@ -26,6 +27,7 @@ const $ = <T extends HTMLElement>(id: string): T =>
 
 const elModel = $<HTMLSelectElement>('model');
 const elLmax = $<HTMLSelectElement>('lmax');
+const elOversample = $<HTMLSelectElement>('oversample');
 const elColormap = $<HTMLSelectElement>('colormap');
 const elRunPause = $<HTMLButtonElement>('runpause');
 const elBenchmark = $<HTMLButtonElement>('benchmark');
@@ -84,11 +86,29 @@ const STEPS_PER_FRAME = 4;
  * fixed cost of a few milliseconds. Spread over one frame's four steps it would
  * swamp them on a fast GPU and make the solver look far slower than it is. So the
  * rate is measured in an occasional larger batch, where the single sync is
- * amortized the way the desktop benchmark amortizes its own. These are ordinary
- * steps: the simulation advances by them like any others.
+ * amortized the way the desktop benchmark amortizes its own. The state is
+ * snapshotted and restored around the batch, so measuring never advances the
+ * simulation — otherwise the pattern would visibly lurch forward at every
+ * measurement.
  */
 const MEASURE_BURST = 32;
 const MEASURE_EVERY_MS = 2000;
+
+/**
+ * 'auto' display oversampling targets this many render latitudes: the factor is
+ * the smallest power of two (up to 4) that reaches it. A solver grid already
+ * this fine gains nothing visually and is not oversampled.
+ */
+const AUTO_RENDER_NLAT = 256;
+
+/** The display oversampling factor the UI currently asks for. */
+function resolveOversample(): number {
+  if (elOversample.value !== 'auto') return Number(elOversample.value);
+  const { nlat } = gridForLmax(Number(elLmax.value), model.pdeg);
+  let os = 1;
+  while (os < 4 && os * nlat < AUTO_RENDER_NLAT) os *= 2;
+  return os;
+}
 
 // ---------------------------------------------------------------- state
 let device: GPUDevice | null = null;
@@ -181,6 +201,12 @@ elModel.addEventListener('change', () => {
   void rebuild();
 });
 elLmax.addEventListener('change', () => void rebuild());
+// Oversampling is display-only, so it swaps the render grid in place rather
+// than rebuilding the run. Serialized: a rapid second change waits its turn.
+let viewChange = Promise.resolve();
+elOversample.addEventListener('change', () => {
+  viewChange = viewChange.then(() => applyOversample());
+});
 elColormap.addEventListener('change', () => void draw());
 
 function setRunning(next: boolean): void {
@@ -241,6 +267,89 @@ function disposeView(): void {
   elPanels.replaceChildren();
 }
 
+/**
+ * Build the mesh, scenes, colorbars and per-species buffers on the current
+ * render grid. Call disposeView() first. The color ranges are kept if present,
+ * so a display-only rebuild (an oversampling change) does not pop the shading;
+ * a full rebuild clears `ranges` beforehand.
+ */
+function buildView(): void {
+  if (!session) return;
+  const view = session.viewSht;
+  const { nphi } = view.cfg;
+  const phi = new Float64Array(nphi);
+  for (let j = 0; j < nphi; j++) phi[j] = (2 * Math.PI * j) / nphi;
+  topo = buildTopology(view.cosTheta, phi);
+
+  const sphereBg = getComputedStyle(document.documentElement)
+    .getPropertyValue('--sphere-bg')
+    .trim();
+  for (let k = 0; k < model.species.length; k++) {
+    const panel = document.createElement('div');
+    panel.className = 'panel';
+    const box = document.createElement('div');
+    box.className = 'sphere-box';
+    const tag = document.createElement('div');
+    tag.className = 'species-tag';
+    tag.textContent = model.species[k];
+    box.append(tag);
+    const side = document.createElement('div');
+    panel.append(box, side);
+    elPanels.append(panel);
+
+    const scene = new SphereScene(
+      box,
+      topo.numVertices,
+      topo.indices,
+      topo.sphereRef,
+      sphereBg || undefined,
+    );
+    scene.fitCamera();
+    scenes.push(scene);
+    colorbars.push(new Colorbar(side));
+    valueBufs[k] = new Float32Array(topo.numVertices);
+    colorBufs[k] = new Float32Array(topo.numVertices * 3);
+    if (!ranges[k]) ranges[k] = { lo: NaN, hi: NaN };
+  }
+  for (let k = 1; k < scenes.length; k++) scenes[0].syncCamerasWith(scenes[k]);
+
+  resizeObs = new ResizeObserver(() => {
+    const boxes = elPanels.querySelectorAll<HTMLElement>('.sphere-box');
+    boxes.forEach((box, i) => {
+      scenes[i]?.resize(box.clientWidth, box.clientHeight);
+    });
+  });
+  elPanels
+    .querySelectorAll<HTMLElement>('.sphere-box')
+    .forEach((box) => resizeObs!.observe(box));
+}
+
+/**
+ * Apply the UI's oversampling choice to the running session. Display-only: the
+ * session and its state survive; only the display plan, mesh and scenes are
+ * rebuilt, keeping the camera pose and color ranges. The pump is drained first
+ * so no readback is in flight on the plan being replaced.
+ */
+async function applyOversample(): Promise<void> {
+  if (!session) return;
+  const gen = generation;
+  const os = resolveOversample();
+  if (os === session.oversample) return;
+  const wasRunning = running;
+  setRunning(false);
+  while (pumping) await nextFrame();
+  if (gen !== generation || !session) return;
+  await session.setOversample(os);
+  if (gen !== generation || !session) return;
+  const cam = scenes[0]?.cameraState();
+  disposeView();
+  buildView();
+  if (cam) for (const s of scenes) s.setCameraState(cam);
+  await draw();
+  updateStats();
+  if (wasRunning) setRunning(true);
+}
+
 /** Report a compile failure, and select the offending text in the editor. */
 function reportCompileError(e: unknown): void {
   elErr.textContent = formatFailure(e, source());
@@ -271,6 +380,7 @@ async function rebuild(): Promise<void> {
       params,
       lmax: Number(elLmax.value),
       source: source(),
+      oversample: resolveOversample(),
     });
   } catch (e) {
     reportCompileError(e);
@@ -286,53 +396,8 @@ async function rebuild(): Promise<void> {
     plan.step.map((l) => `  ${l}`).join('\n');
   elRecompile.textContent = 'Recompile';
 
-  // mesh + scenes
-  const { nphi } = session.cfg;
-  const phi = new Float64Array(nphi);
-  for (let j = 0; j < nphi; j++) phi[j] = (2 * Math.PI * j) / nphi;
-  topo = buildTopology(session.sht.cosTheta, phi);
-
-  const sphereBg = getComputedStyle(document.documentElement)
-    .getPropertyValue('--sphere-bg')
-    .trim();
-  for (let k = 0; k < model.species.length; k++) {
-    const panel = document.createElement('div');
-    panel.className = 'panel';
-    const box = document.createElement('div');
-    box.className = 'sphere-box';
-    const tag = document.createElement('div');
-    tag.className = 'species-tag';
-    tag.textContent = model.species[k];
-    box.append(tag);
-    const side = document.createElement('div');
-    panel.append(box, side);
-    elPanels.append(panel);
-
-    const scene = new SphereScene(
-      box,
-      topo.numVertices,
-      topo.indices,
-      topo.sphereRef,
-      sphereBg || undefined,
-    );
-    scene.fitCamera();
-    scenes.push(scene);
-    colorbars.push(new Colorbar(side));
-    valueBufs[k] = new Float32Array(topo.numVertices);
-    colorBufs[k] = new Float32Array(topo.numVertices * 3);
-    ranges[k] = { lo: NaN, hi: NaN };
-  }
-  for (let k = 1; k < scenes.length; k++) scenes[0].syncCamerasWith(scenes[k]);
-
-  resizeObs = new ResizeObserver(() => {
-    const boxes = elPanels.querySelectorAll<HTMLElement>('.sphere-box');
-    boxes.forEach((box, i) => {
-      scenes[i]?.resize(box.clientWidth, box.clientHeight);
-    });
-  });
-  elPanels
-    .querySelectorAll<HTMLElement>('.sphere-box')
-    .forEach((box) => resizeObs!.observe(box));
+  ranges = [];
+  buildView();
 
   await draw();
   updateStats();
@@ -363,7 +428,7 @@ async function draw(): Promise<void> {
     // mapped, which rejects the map; that result is stale anyway, so drop it.
     let field: Float32Array;
     try {
-      field = await session.read(model.species[k]);
+      field = await session.readSpecies(k);
     } catch (e) {
       if (gen !== generation) return;
       throw e;
@@ -411,8 +476,13 @@ function updateStats(): void {
     frameMs > 0
       ? `${frameMs.toFixed(1)} ms/frame (${STEPS_PER_FRAME} steps + readback + render)`
       : '—';
+  const view = session.viewSht.cfg;
+  const render =
+    session.oversample > 1
+      ? ` (display ${view.nlat}×${view.nphi}, ${session.oversample}×)`
+      : '';
   elStats.innerHTML =
-    `<b>${kind}</b> · grid ${nlat}×${nphi} · nlm ${session.sht.nlm.toLocaleString()} · ` +
+    `<b>${kind}</b> · grid ${nlat}×${nphi}${render} · nlm ${session.sht.nlm.toLocaleString()} · ` +
     `${session.sht.fourierMode.toUpperCase()} · solver ${solver} · ${frame} · ` +
     `t = <b>${session.t.toFixed(2)}</b> (${session.steps} steps)`;
 }
@@ -428,13 +498,12 @@ async function pump(): Promise<void> {
     while (running && session && gen === generation) {
       // Occasionally, a burst purely to measure the solver rate: many steps,
       // one sync, nothing read back — directly comparable to the desktop
-      // benchmark's throughput number.
+      // benchmark's throughput number. State-preserving: the display and
+      // model time are unaffected.
       if (performance.now() - lastMeasure > MEASURE_EVERY_MS) {
-        const m0 = performance.now();
-        session.step(MEASURE_BURST);
-        await session.sync();
+        const ms = await session.measure(MEASURE_BURST);
         if (gen !== generation) break;
-        solverMs = (performance.now() - m0) / MEASURE_BURST;
+        solverMs = ms;
         lastMeasure = performance.now();
       }
 

@@ -78,4 +78,94 @@ export async function modelChecks(
 
     session.destroy();
   }
+
+  // The oversampled readback: readSpecies must be the state synthesized on the
+  // display grid. Comparing against the display plan's own upload path
+  // (read the state back, synth it from the CPU) exercises the GPU-to-GPU
+  // coefficient copy against a known-good route through the same kernels.
+  {
+    const model = mModels.find((m) => m.key === 'allencahn')!;
+    const session = await ModelSession.create({
+      device,
+      model,
+      params: defaultParams(model),
+      lmax: LMAX,
+      oversample: 2,
+    });
+    session.seed(1);
+    session.step(STEPS);
+
+    const fine = await session.readSpecies(0);
+    const { nlat, nphi } = session.viewSht.cfg;
+    check(
+      'oversample: species field is on the 2x display grid',
+      nlat === 2 * session.cfg.nlat &&
+        nphi === 2 * session.cfg.nphi &&
+        fine.length === nlat * nphi,
+      `render ${nlat}×${nphi}, ${fine.length} values`,
+    );
+
+    const qlm = await session.read('U');
+    const expected = await session.viewSht.synth(qlm);
+    let maxDiff = 0;
+    for (let i = 0; i < fine.length; i++) {
+      const d = Math.abs(fine[i] - expected[i]);
+      if (d > maxDiff) maxDiff = d;
+    }
+    check(
+      'oversample: readSpecies matches synth of the read-back state',
+      maxDiff <= 1e-6,
+      `max |diff| = ${maxDiff.toExponential(2)}`,
+    );
+
+    // A timing burst must be invisible: the state is snapshotted and restored
+    // around it, and model time does not advance.
+    const tBefore = session.t;
+    const stepsBefore = session.steps;
+    const ms = await session.measure(8);
+    const after = await session.read('U');
+    let identical = qlm.length === after.length;
+    if (identical) {
+      for (let i = 0; i < qlm.length; i++) {
+        if (qlm[i] !== after[i]) {
+          identical = false;
+          break;
+        }
+      }
+    }
+    check(
+      'measure: a timing burst leaves state, t and steps untouched',
+      identical && session.t === tBefore && session.steps === stepsBefore,
+      identical
+        ? `state identical, t = ${session.t.toFixed(3)}, ${ms.toFixed(3)} ms/step`
+        : 'state changed',
+    );
+
+    // Changing the oversampling in place is display-only: the state survives
+    // and the render grid drops back to the solver's.
+    await session.setOversample(1);
+    const qlmAfterSwap = await session.read('U');
+    let stateSurvived = qlmAfterSwap.length === after.length;
+    if (stateSurvived) {
+      for (let i = 0; i < after.length; i++) {
+        if (qlmAfterSwap[i] !== after[i]) {
+          stateSurvived = false;
+          break;
+        }
+      }
+    }
+    session.step(1); // recompute the view fields on the solver grid
+    const coarse = await session.readSpecies(0);
+    check(
+      'setOversample: swaps the render grid without touching the state',
+      stateSurvived &&
+        session.viewSht === session.sht &&
+        coarse.length === session.cfg.nlat * session.cfg.nphi,
+      stateSurvived
+        ? `state survived, render back to ${session.cfg.nlat}×${session.cfg.nphi}`
+        : 'state changed',
+    );
+
+    session.destroy();
+  }
 }
