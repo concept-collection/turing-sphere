@@ -25,6 +25,8 @@ export interface LegParams {
   wgAnalys: number; // workgroup size for analysis (power of two)
   /** Use subgroup reductions in the analysis kernel (needs the `subgroups` feature). */
   subgroups?: boolean;
+  /** l-pairs accumulated before the span is reduced (subgroup path only). */
+  spanPairs?: number;
 }
 
 const BINDINGS = /* wgsl */ `
@@ -114,13 +116,26 @@ export function legAnalysWGSL(p: LegParams): string {
   // per subgroup; WebGPU guarantees subgroup size >= 4, so wgAnalys/4 is a safe
   // upper bound on how many there can be.
   const sg = p.subgroups === true;
-  const redLen = sg ? Math.max(1, p.wgAnalys / 4) : p.wgAnalys;
+  // Reduce once per span of l-pairs rather than once per pair. The l-loop is
+  // serial, so its barriers are the critical path: at lmax=127 the m=0
+  // workgroup paid 2 of them 64 times over. SHTNS amortizes the same way
+  // (LSPAN_A = 16, or 32 for fp32), staging a whole span before reducing.
+  // Partials for the span live in registers and are combined in one batch.
+  const nsubMax = Math.max(1, p.wgAnalys / 4); // WebGPU guarantees subgroup size >= 4
+  // 16 pairs = 32 l-values, which is what SHTNS uses for fp32 (LSPAN_A). Clamped
+  // so `red` stays within 8 KB of workgroup storage, since nsubMax has to assume
+  // the smallest legal subgroup and would otherwise oversize it badly.
+  const pairs = sg
+    ? Math.max(1, Math.min(p.spanPairs ?? 16, Math.floor(8192 / (nsubMax * 16))))
+    : 1;
+  const redLen = sg ? nsubMax * pairs : p.wgAnalys;
   return /* wgsl */ `${sg ? 'enable subgroups;\n' : ''}
 ${RESCALE_WGSL}
 const LMAX: u32 = ${p.lmax}u;
 const NLAT: u32 = ${p.nlat}u;
 const WG: u32 = ${p.wgAnalys}u;
 const K: u32 = ${K}u;
+const PAIRS: u32 = ${pairs}u;
 ${BINDINGS}
 @group(0) @binding(3) var<storage, read> fm: array<vec2f>;        // [(m)*NLAT + ilat]
 @group(0) @binding(4) var<storage, read_write> qout: array<vec2f>;
@@ -167,7 +182,66 @@ fn leg_analys(@builtin(local_invocation_id) lid3: vec3u,
   }
 
   var l = m;
+${
+    sg
+      ? `  // Accumulate up to PAIRS l-pairs into registers, then reduce the whole span
+  // at once: 2 barriers per span instead of 2 per pair.
   loop {
+    let lstart = l;
+    var npairs = 0u;
+    var last = false;
+    let sub = lid / sgSize;
+    for (var jj = 0u; jj < PAIRS; jj++) {
+      var c0 = vec2f(0.0);
+      var c1 = vec2f(0.0);
+      for (var k = 0u; k < K; k++) {
+        if (nyv[k] == 0) {
+          c0 += wfv[k] * y0v[k];
+          c1 += wfv[k] * y1v[k];
+        } else if (abs(y0v[k]) > RESCALE_THR) {
+          nyv[k] += 1;
+          y0v[k] *= INV_SCALE;
+          y1v[k] *= INV_SCALE;
+        }
+      }
+      // subgroupAdd needs no barrier, so the per-subgroup partial can go
+      // straight to shared memory; only the cross-subgroup combine below has
+      // to wait, and it waits once for the whole span.
+      let part = subgroupAdd(vec4f(c0, c1));
+      if (sgLane == 0u) { red[sub * PAIRS + jj] = part; }
+      npairs = jj + 1u;
+      if (l + 2u > LMAX) { last = true; break; }
+      let a0 = ab[base + (l + 2u - m)];
+      var a1 = vec2f(0.0);
+      if (l + 3u <= LMAX) {
+        a1 = ab[base + (l + 3u - m)];
+      }
+      for (var k = 0u; k < K; k++) {
+        let t0 = a0.x * ctv[k] * y1v[k] + a0.y * y0v[k];
+        y0v[k] = t0;
+        y1v[k] = a1.x * ctv[k] * t0 + a1.y * y1v[k];
+      }
+      l += 2u;
+    }
+
+    workgroupBarrier();
+    if (lid == 0u) {
+      let nsub = (WG + sgSize - 1u) / sgSize;
+      for (var jj = 0u; jj < npairs; jj++) {
+        var tot = vec4f(0.0);
+        for (var i = 0u; i < nsub; i++) { tot += red[i * PAIRS + jj]; }
+        let ll = lstart + 2u * jj;
+        qout[base + (ll - m)] = tot.xy;
+        if (ll + 1u <= LMAX) {
+          qout[base + (ll + 1u - m)] = tot.zw;
+        }
+      }
+    }
+    workgroupBarrier();   // red is reused by the next span
+
+    if (last) { break; }
+  }`
+      : `  loop {
     var c0 = vec2f(0.0);
     var c1 = vec2f(0.0);
     for (var k = 0u; k < K; k++) {
@@ -180,25 +254,7 @@ fn leg_analys(@builtin(local_invocation_id) lid3: vec3u,
         y1v[k] *= INV_SCALE;
       }
     }
-${
-    sg
-      ? `    // Reduce (c0, c1) across the workgroup: one subgroupAdd, then combine the
-    // per-subgroup partials. Two barriers per l-pair rather than 1 + log2(WG),
-    // and no half-idle tree. Both barriers sit in uniform control flow.
-    let part = subgroupAdd(vec4f(c0, c1));
-    if (sgLane == 0u) { red[lid / sgSize] = part; }
-    workgroupBarrier();
-    if (lid == 0u) {
-      var tot = vec4f(0.0);
-      let nsub = (WG + sgSize - 1u) / sgSize;
-      for (var i = 0u; i < nsub; i++) { tot += red[i]; }
-      qout[base + (l - m)] = tot.xy;
-      if (l + 1u <= LMAX) {
-        qout[base + (l + 1u - m)] = tot.zw;
-      }
-    }
-    workgroupBarrier();   // red is reused next iteration`
-      : `    // workgroup tree reduction of (c0, c1)
+    // workgroup tree reduction of (c0, c1)
     red[lid] = vec4f(c0, c1);
     workgroupBarrier();
     var s = WG / 2u;
@@ -212,8 +268,7 @@ ${
       if (l + 1u <= LMAX) {
         qout[base + (l + 1u - m)] = red[0].zw;
       }
-    }`
-  }
+    }
     if (l + 2u > LMAX) { break; }
     let a0 = ab[base + (l + 2u - m)];
     var a1 = vec2f(0.0);
@@ -226,6 +281,7 @@ ${
       y1v[k] = a1.x * ctv[k] * t0 + a1.y * y1v[k];
     }
     l += 2u;
+  }`
   }
 }
 `;

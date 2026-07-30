@@ -230,6 +230,7 @@ export class ShtPlan {
       wgSynth: WG_SYNTH,
       wgAnalys,
       subgroups,
+      spanPairs: tuning('SHT_SPAN_PAIRS') as number | undefined,
     };
     const fourP = { mmax, nlat, nphi };
     const [pLegS, pLegA, pFourS, pFourA] = await Promise.all([
