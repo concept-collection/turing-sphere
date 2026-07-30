@@ -13,6 +13,8 @@ import { legSynthWGSL, legAnalysWGSL } from './wgsl/leg.ts';
 import {
   fftSynthWGSL,
   fftAnalysWGSL,
+  fftSynthRealWGSL,
+  fftAnalysRealWGSL,
   dftSynthWGSL,
   dftAnalysWGSL,
   fftThreads,
@@ -35,7 +37,56 @@ export interface ShtOptions {
 }
 
 const WG_SYNTH = 64;
-const WG_ANALYS = 256;
+
+/**
+ * Tuning knob, for A/B-ing a change without editing code. Reads globalThis
+ * first (set it before creating a plan, as scripts/_ab.ts does), then the
+ * environment, so `SHT_SUBGROUPS=0 npm run bench:sht` works too. `process` is
+ * absent in the browser, where only the globalThis form applies.
+ */
+function tuning(name: string): unknown {
+  const g = (globalThis as Record<string, unknown>)[name];
+  if (g !== undefined) return g;
+  const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env?.[name];
+  if (env === undefined || env === '') return undefined;
+  if (env === '1' || env === 'true') return true;
+  if (env === '0' || env === 'false') return false;
+  const n = Number(env);
+  return Number.isFinite(n) ? n : env;
+}
+
+/**
+ * Workgroup size for the analysis Legendre reduction. The right answer differs
+ * between the two reduction strategies, so it is chosen per strategy.
+ *
+ * Measured on an RTX PRO 6000 Blackwell (analysis, us). Shared-memory tree,
+ * where each doubling of wgAnalys costs another barrier per l-pair:
+ *
+ *          wgAnalys:   16     32     64    128    256
+ *   nlat=128          43.2   40.6   42.6   46.7   52.9   -> 32
+ *   nlat=256         104.0   85.6   87.8   89.9  100.0   -> 32
+ *   nlat=512         408.8  216.9  184.4  190.8  204.8   -> 64
+ *
+ * i.e. max(32, nlat/8). A flat 32 would be worse than the old default of 256 at
+ * nlat=512, so it cannot be fitted on one grid. With subgroupAdd the barrier
+ * count stops growing with wgAnalys and the picture inverts: threads in flight,
+ * (mmax+1) * wgAnalys, becomes binding, since analysis dispatches only mmax+1
+ * workgroups. 128 then wins at every grid (round trip, us):
+ *
+ *   128x256  37.8 (vs 38.3),  256x512  66.6 (vs 74.7),  512x1024  131.9 (vs 156.6)
+ */
+function defaultWgAnalys(nlat: number, limit: number, subgroups: boolean): number {
+  if (subgroups) {
+    // capped at nlat so small grids do not launch threads with no latitude to own
+    let cap = 1;
+    while (cap < nlat) cap *= 2;
+    return Math.min(128, limit, cap);
+  }
+  const target = Math.max(32, nlat / 8);
+  let wg = 1;
+  while (wg < target) wg *= 2; // the tree reduction halves, so a power of two
+  return Math.min(wg, limit);
+}
 
 async function makePipeline(
   device: GPUDevice,
@@ -66,6 +117,8 @@ export class ShtPlan {
   readonly cfg: ShtConfig;
   readonly nlm: number;
   readonly fourierMode: 'fft' | 'dft';
+  /** Latitudes leg_synth walks: nlat/2 when parity folding. */
+  readonly legLat: number = 0;
   /** Colatitudes theta_i (f64, increasing: north to south). */
   readonly theta: Float64Array;
   readonly cosTheta: Float64Array;
@@ -170,19 +223,44 @@ export class ShtPlan {
     dev.queue.writeBuffer(this.bufTrig, 0, trig);
 
     // --- shaders / pipelines ---
-    const legP = { lmax, mmax, nlat, wgSynth: WG_SYNTH, wgAnalys: WG_ANALYS };
-    const fourP = { mmax, nlat, nphi };
+    const subgroups = tuning('SHT_SUBGROUPS') !== false && dev.features.has('subgroups');
+    // parity folding needs an equator-symmetric grid; Gauss nodes are, if nlat is even
+    const parity = tuning('SHT_PARITY') !== false && nlat % 2 === 0;
+    const wgAnalys =
+      (tuning('SHT_WG_ANALYS') as number | undefined) ??
+      defaultWgAnalys(nlat, dev.limits.maxComputeInvocationsPerWorkgroup, subgroups);
+    const legP = {
+      lmax,
+      mmax,
+      nlat,
+      wgSynth: WG_SYNTH,
+      wgAnalys,
+      subgroups,
+      spanPairs: tuning('SHT_SPAN_PAIRS') as number | undefined,
+      parity,
+    };
+    (this as { legLat: number }).legLat = parity ? nlat / 2 : nlat;
+    const fourP = { mmax, nlat, nphi, radix: (tuning('SHT_RADIX') as number | undefined) ?? 4 };
+    // The spatial field is real (layout.ts stores m >= 0 only), so the Fourier
+    // stage can run an nphi/2-point complex FFT plus a recombination instead of
+    // a full nphi-point one: half the arithmetic and half the workgroup storage.
+    // The complex kernels remain for a future complex-valued field, and are what
+    // SHT_REAL_FFT=0 selects.
+    const realFft =
+      this.fourierMode === 'fft' && nphi % 2 === 0 && tuning('SHT_REAL_FFT') !== false;
+    const fftS = realFft ? fftSynthRealWGSL : fftSynthWGSL;
+    const fftA = realFft ? fftAnalysRealWGSL : fftAnalysWGSL;
     const [pLegS, pLegA, pFourS, pFourA] = await Promise.all([
       makePipeline(dev, legSynthWGSL(legP), 'leg_synth'),
       makePipeline(dev, legAnalysWGSL(legP), 'leg_analys'),
       makePipeline(
         dev,
-        this.fourierMode === 'fft' ? fftSynthWGSL(fourP) : dftSynthWGSL(fourP),
+        this.fourierMode === 'fft' ? fftS(fourP) : dftSynthWGSL(fourP),
         this.fourierMode === 'fft' ? 'fft_synth' : 'dft_synth',
       ),
       makePipeline(
         dev,
-        this.fourierMode === 'fft' ? fftAnalysWGSL(fourP) : dftAnalysWGSL(fourP),
+        this.fourierMode === 'fft' ? fftA(fourP) : dftAnalysWGSL(fourP),
         this.fourierMode === 'fft' ? 'fft_analys' : 'dft_analys',
       ),
     ]);
@@ -249,7 +327,7 @@ export class ShtPlan {
     const { mmax, nlat, nphi } = this.cfg;
     pass.setPipeline(this.pipeLegSynth);
     pass.setBindGroup(0, b.bgLeg);
-    pass.dispatchWorkgroups(Math.ceil(nlat / WG_SYNTH), mmax + 1);
+    pass.dispatchWorkgroups(Math.ceil(this.legLat / WG_SYNTH), mmax + 1);
     pass.setPipeline(this.pipeFourSynth);
     pass.setBindGroup(0, b.bgFour);
     if (this.fourierMode === 'fft') {
@@ -278,6 +356,47 @@ export class ShtPlan {
   encodeSynth(encoder: GPUCommandEncoder): void {
     const pass = encoder.beginComputePass({ label: 'sht-synth' });
     this.encodeSynthInto(pass, { bgLeg: this.bgLegSynth, bgFour: this.bgFourSynth });
+    pass.end();
+  }
+
+  /**
+   * Diagnostics: encode one stage alone, in its own pass, so a timestamp query
+   * can measure just that kernel. The solver wants both stages in a shared pass
+   * and should use encodeSynthInto/encodeAnalysInto; this exists because
+   * inferring per-kernel cost by subtracting trivially-sized runs is unreliable.
+   */
+  encodeStage(
+    encoder: GPUCommandEncoder,
+    stage: 'legSynth' | 'fourSynth' | 'fourAnalys' | 'legAnalys',
+    timestampWrites?: GPUComputePassTimestampWrites,
+  ): void {
+    const { mmax, nlat, nphi } = this.cfg;
+    const fft = this.fourierMode === 'fft';
+    const pass = encoder.beginComputePass({ label: `sht-${stage}`, timestampWrites });
+    switch (stage) {
+      case 'legSynth':
+        pass.setPipeline(this.pipeLegSynth);
+        pass.setBindGroup(0, this.bgLegSynth);
+        pass.dispatchWorkgroups(Math.ceil(this.legLat / WG_SYNTH), mmax + 1);
+        break;
+      case 'fourSynth':
+        pass.setPipeline(this.pipeFourSynth);
+        pass.setBindGroup(0, this.bgFourSynth);
+        if (fft) pass.dispatchWorkgroups(nlat);
+        else pass.dispatchWorkgroups(Math.ceil(nphi / 64), nlat);
+        break;
+      case 'fourAnalys':
+        pass.setPipeline(this.pipeFourAnalys);
+        pass.setBindGroup(0, this.bgFourAnalys);
+        if (fft) pass.dispatchWorkgroups(nlat);
+        else pass.dispatchWorkgroups(Math.ceil((mmax + 1) / 64), nlat);
+        break;
+      case 'legAnalys':
+        pass.setPipeline(this.pipeLegAnalys);
+        pass.setBindGroup(0, this.bgLegAnalys);
+        pass.dispatchWorkgroups(mmax + 1);
+        break;
+    }
     pass.end();
   }
 
@@ -359,7 +478,16 @@ export async function requestShtDevice(): Promise<GPUDevice> {
   if (!adapter) throw new Error('No WebGPU adapter available');
   // ask for a larger workgroup storage if the adapter offers it (bigger FFTs)
   const wgStorage = Math.min(adapter.limits.maxComputeWorkgroupStorageSize, 32768);
+  // `subgroups` lets the analysis reduction use subgroupAdd instead of a
+  // shared-memory tree (2 barriers per l-pair instead of 1 + log2(wgAnalys)).
+  // Optional: ShtPlan falls back to the tree when it is not available.
+  const features: GPUFeatureName[] = [];
+  if (adapter.features.has('subgroups')) features.push('subgroups');
+  // timestamp-query is only used by the profiling scripts, but it has to be
+  // requested at device creation, and asking costs nothing when unused.
+  if (adapter.features.has('timestamp-query')) features.push('timestamp-query');
   return adapter.requestDevice({
+    requiredFeatures: features,
     requiredLimits: { maxComputeWorkgroupStorageSize: wgStorage },
   });
 }
