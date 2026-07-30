@@ -73,12 +73,30 @@ fn leg_synth(@builtin(global_invocation_id) gid: vec3u,
       y1 *= INV_SCALE;
     }
     if (l + 2u > LMAX) { break; }
-    let c0 = ab[base + (l + 2u - m)];
-    y0 = c0.x * ct * y1 + c0.y * y0;
+    // Advance (y_l, y_{l+1}) to (y_{l+2}, y_{l+3}).
+    //
+    // Written in exactly the shape leg_analys uses below — both coefficients
+    // fetched unconditionally, the new y0 carried in a temporary rather than
+    // assigned and then read back by the y1 update. The shorter form,
+    //
+    //   let c0 = ab[base + (l + 2u - m)];
+    //   y0 = c0.x * ct * y1 + c0.y * y0;
+    //   if (l + 3u <= LMAX) { ... y1 = c1.x * ct * y0 + c1.y * y1; }
+    //
+    // says the same thing and is what this was, but NVIDIA's Vulkan compiler
+    // (driver 590.48, Blackwell) mis-compiles it: c0 reads as (0, 0) on the
+    // first iteration, so y_{l+2} comes out exactly zero and every later term
+    // follows a different solution of the recurrence, reaching ~1e11 by l = 63.
+    // leg_analys, doing the same arithmetic in this shape, was correct on the
+    // same driver. See scripts/diagnose-leg.ts, which is how that was found.
+    let a0 = ab[base + (l + 2u - m)];
+    var a1 = vec2f(0.0);
     if (l + 3u <= LMAX) {
-      let c1 = ab[base + (l + 3u - m)];
-      y1 = c1.x * ct * y0 + c1.y * y1;
+      a1 = ab[base + (l + 3u - m)];
     }
+    let t0 = a0.x * ct * y1 + a0.y * y0;
+    y1 = a1.x * ct * t0 + a1.y * y1;
+    y0 = t0;
     l += 2u;
   }
   fm[m * NLAT + ilat] = acc;
