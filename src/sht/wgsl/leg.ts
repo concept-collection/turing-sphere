@@ -305,8 +305,13 @@ ${
     var c1 = vec2f(0.0);
     for (var k = 0u; k < K; k++) {
       if (nyv[k] == 0) {
-        c0 += wfv[k] * y0v[k];
-        c1 += wfv[k] * y1v[k];
+${
+          half
+            ? `        c0 += wpv[k] * y0v[k];   // even (l-m): hemispheres add
+        c1 += wmv[k] * y1v[k];   // odd  (l-m): hemispheres subtract`
+            : `        c0 += wfv[k] * y0v[k];
+        c1 += wfv[k] * y1v[k];`
+        }
       } else if (abs(y0v[k]) > RESCALE_THR) {
         nyv[k] += 1;
         y0v[k] *= INV_SCALE;
