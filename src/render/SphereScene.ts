@@ -6,6 +6,10 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
  * per-vertex positions and dynamic per-vertex colors, orbit controls, and
  * optional camera synchronization with sibling scenes.
  *
+ * Rendering is on demand: the animation loop ticks every frame (it has to,
+ * to drive OrbitControls damping), but only re-renders when the colors,
+ * camera, or canvas size actually changed.
+ *
  * Adapted from figpack's SphereEmbedding view (figpack_experimental).
  */
 export class SphereScene {
@@ -21,6 +25,7 @@ export class SphereScene {
     target: THREE.Vector3;
   } | null = null;
   #syncing = false;
+  #needsRender = true;
   #lastW = -1;
   #lastH = -1;
 
@@ -78,6 +83,11 @@ export class SphereScene {
     this.#controls = new OrbitControls(this.#camera, this.#renderer.domElement);
     this.#controls.enableDamping = true;
     this.#controls.dampingFactor = 0.1;
+    // Fires on user input and on every damping-tail update, so the flag stays
+    // set until the camera has fully settled.
+    this.#controls.addEventListener('change', () => {
+      this.#needsRender = true;
+    });
 
     this.#animate();
   }
@@ -85,6 +95,8 @@ export class SphereScene {
   #animate = () => {
     this.#animationId = requestAnimationFrame(this.#animate);
     this.#controls.update();
+    if (!this.#needsRender) return;
+    this.#needsRender = false;
     this.#renderer.render(this.#scene, this.#camera);
   };
 
@@ -92,6 +104,7 @@ export class SphereScene {
     const attr = this.#geometry.getAttribute('color') as THREE.BufferAttribute;
     (attr.array as Float32Array).set(colors);
     attr.needsUpdate = true;
+    this.#needsRender = true;
   }
 
   /** Mirror this scene's camera whenever the other scene's controls move. */
@@ -105,11 +118,34 @@ export class SphereScene {
         dst.#camera.updateProjectionMatrix();
         dst.#controls.target.copy(src.#controls.target);
         dst.#controls.update();
+        dst.#needsRender = true;
         src.#syncing = false;
       });
     };
     follow(this, other);
     follow(other, this);
+  }
+
+  /** Camera pose, for carrying the view across a scene rebuild. */
+  cameraState(): { position: THREE.Vector3; target: THREE.Vector3; zoom: number } {
+    return {
+      position: this.#camera.position.clone(),
+      target: this.#controls.target.clone(),
+      zoom: this.#camera.zoom,
+    };
+  }
+
+  setCameraState(s: {
+    position: THREE.Vector3;
+    target: THREE.Vector3;
+    zoom: number;
+  }): void {
+    this.#camera.position.copy(s.position);
+    this.#camera.zoom = s.zoom;
+    this.#camera.updateProjectionMatrix();
+    this.#controls.target.copy(s.target);
+    this.#controls.update();
+    this.#needsRender = true;
   }
 
   /** Position the camera to comfortably frame the geometry. */
@@ -129,6 +165,7 @@ export class SphereScene {
     this.#camera.far = radius * 100;
     this.#camera.updateProjectionMatrix();
     this.#controls.update();
+    this.#needsRender = true;
     this.#defaultCameraState = {
       position: this.#camera.position.clone(),
       target: this.#controls.target.clone(),
@@ -140,6 +177,7 @@ export class SphereScene {
       this.#camera.position.copy(this.#defaultCameraState.position);
       this.#controls.target.copy(this.#defaultCameraState.target);
       this.#controls.update();
+      this.#needsRender = true;
     } else {
       this.fitCamera();
     }
@@ -155,6 +193,9 @@ export class SphereScene {
     this.#camera.updateProjectionMatrix();
     // updateStyle=false: the canvas keeps its 100%/100% CSS sizing
     this.#renderer.setSize(width, height, false);
+    // setSize clears the drawing buffer, so a re-render is required even
+    // though nothing in the scene moved
+    this.#needsRender = true;
   }
 
   dispose(): void {

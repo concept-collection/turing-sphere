@@ -425,6 +425,26 @@ export class ShtPlan {
     return out;
   }
 
+  /**
+   * Spectral -> spatial, with the coefficients read from a caller-owned GPU
+   * buffer (interleaved [re, im], 8*nlm bytes, COPY_SRC) instead of uploaded
+   * from the CPU. This is how a field already on the device — a model's
+   * spectral state — is evaluated on this plan's grid, e.g. a finer display
+   * grid than the one the coefficients were produced on.
+   */
+  async synthFrom(qlmSrc: GPUBuffer): Promise<Float32Array> {
+    const { nlat, nphi } = this.cfg;
+    const enc = this.device.createCommandEncoder({ label: 'sht-synth-from' });
+    enc.copyBufferToBuffer(qlmSrc, 0, this.qlmIn, 0, 8 * this.nlm);
+    this.encodeSynth(enc);
+    enc.copyBufferToBuffer(this.spatBuf, 0, this.stageSpat, 0, 4 * nlat * nphi);
+    this.device.queue.submit([enc.finish()]);
+    await this.stageSpat.mapAsync(GPUMapMode.READ);
+    const out = new Float32Array(this.stageSpat.getMappedRange().slice(0));
+    this.stageSpat.unmap();
+    return out;
+  }
+
   /** Spatial -> spectral.  spat: length nlat*nphi.  Returns interleaved qlm, length 2*nlm. */
   async analys(spat: Float32Array): Promise<Float32Array> {
     const { nlat, nphi } = this.cfg;

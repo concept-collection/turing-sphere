@@ -67,8 +67,12 @@ export class GpuModel {
   #initPlan: ModelPlan;
   #stepPlan: ModelPlan;
   #readback: GPUBuffer;
+  /** Scratch holding a copy of the whole spectral state; see snapshotState. */
+  #stash: GPUBuffer;
   /** Which function wrote the state most recently; see `read`. */
   #lastRan: 'init' | 'step' = 'init';
+  #stashedRan: 'init' | 'step' = 'init';
+  #destroyed = false;
 
   private constructor(init: {
     device: GPUDevice;
@@ -76,6 +80,7 @@ export class GpuModel {
     initPlan: ModelPlan;
     stepPlan: ModelPlan;
     readback: GPUBuffer;
+    stash: GPUBuffer;
     paramNames: string[];
     state: string[];
     view: string[];
@@ -87,6 +92,7 @@ export class GpuModel {
     this.#initPlan = init.initPlan;
     this.#stepPlan = init.stepPlan;
     this.#readback = init.readback;
+    this.#stash = init.stash;
     this.paramNames = init.paramNames;
     this.state = init.state;
     this.view = init.view;
@@ -144,9 +150,14 @@ export class GpuModel {
       size: 4 * Math.max(npts, 2 * nlm),
       usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
     });
+    const stash = device.createBuffer({
+      label: 'mgpu-state-stash',
+      size: 4 * state.length * 2 * nlm,
+      usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
 
     return new GpuModel({
-      device, host, initPlan, stepPlan, readback,
+      device, host, initPlan, stepPlan, readback, stash,
       paramNames, state, view, npts, nlm,
     });
   }
@@ -175,6 +186,43 @@ export class GpuModel {
   }
 
   /**
+   * Copy the spectral state aside, so a batch of steps can run — to be timed —
+   * and then be undone with restoreState, leaving the simulation exactly where
+   * it was. Only the state is stashed: the grid view fields keep whatever the
+   * batch last wrote until a subsequent step recomputes them, so step before
+   * reading a view after a restore.
+   */
+  snapshotState(): void {
+    this.#stashedRan = this.#lastRan;
+    this.#copyState('save');
+  }
+
+  restoreState(): void {
+    this.#copyState('restore');
+    this.#lastRan = this.#stashedRan;
+  }
+
+  #copyState(dir: 'save' | 'restore'): void {
+    // A restore can land after a rebuild destroyed the buffers mid-await;
+    // there is nothing left to protect, so do not submit into destroyed state.
+    if (this.#destroyed) return;
+    const enc = this.#device.createCommandEncoder({ label: `mgpu-state-${dir}` });
+    let offset = 0;
+    for (const name of this.state) {
+      const slot = this.#host.get(name);
+      if (!slot) throw new Error(`state '${name}' has no host buffer`);
+      const bytes = 4 * slot.count;
+      if (dir === 'save') {
+        enc.copyBufferToBuffer(slot.buffer, 0, this.#stash, offset, bytes);
+      } else {
+        enc.copyBufferToBuffer(this.#stash, offset, slot.buffer, 0, bytes);
+      }
+      offset += bytes;
+    }
+    this.#device.queue.submit([enc.finish()]);
+  }
+
+  /**
    * Advance `steps` timesteps. Synchronous — this only records commands and
    * submits them; nothing is read back and nothing is awaited.
    */
@@ -186,23 +234,37 @@ export class GpuModel {
   }
 
   /**
-   * Read a named value back to the CPU. The only await in the whole loop.
-   *
-   * Grid fields like `u` are produced by both functions, into separate buffers
-   * (only the spectral state is shared), so this reads from whichever ran most
-   * recently — which is what makes the first frame show the initial state
-   * rather than an unwritten buffer.
+   * The buffer currently holding a named value. Grid fields like `u` are
+   * produced by both functions, into separate buffers (only the spectral state
+   * is shared), so this resolves to whichever function ran most recently —
+   * which is what makes the first frame show the initial state rather than an
+   * unwritten buffer.
    */
-  async read(name: string): Promise<Float32Array> {
+  #locate(name: string): { buffer: GPUBuffer; count: number } | null {
     const [first, second] =
       this.#lastRan === 'init'
         ? [this.#initPlan, this.#stepPlan]
         : [this.#stepPlan, this.#initPlan];
     const buffer = first.buffer(name) ?? second.buffer(name);
     const count = first.elementCount(name) ?? second.elementCount(name);
-    if (!buffer || count === undefined) {
+    if (!buffer || count === undefined) return null;
+    return { buffer, count };
+  }
+
+  /** The GPU buffer a named value would be read from right now — for encoding
+   *  further GPU work against it (e.g. a display-grid synthesis of the state)
+   *  without a CPU round trip. */
+  valueBuffer(name: string): GPUBuffer | null {
+    return this.#locate(name)?.buffer ?? null;
+  }
+
+  /** Read a named value back to the CPU. The only await in the whole loop. */
+  async read(name: string): Promise<Float32Array> {
+    const located = this.#locate(name);
+    if (!located) {
       throw new Error(`read: the model has no value named '${name}'`);
     }
+    const { buffer, count } = located;
     const enc = this.#device.createCommandEncoder({ label: `mgpu-read-${name}` });
     enc.copyBufferToBuffer(buffer, 0, this.#readback, 0, 4 * count);
     this.#device.queue.submit([enc.finish()]);
@@ -218,9 +280,11 @@ export class GpuModel {
   }
 
   destroy(): void {
+    this.#destroyed = true;
     this.#initPlan.destroy();
     this.#stepPlan.destroy();
     this.#host.destroy();
     this.#readback.destroy();
+    this.#stash.destroy();
   }
 }
