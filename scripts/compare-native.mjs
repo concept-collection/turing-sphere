@@ -421,6 +421,24 @@ if (wantJson) {
       );
     }
   }
+  // A run whose CPU-side share is most of its wall time is not measuring the GPU
+  // at all — it is measuring how long the host takes to queue the work. That is a
+  // real cost, but it puts a floor under the number that has nothing to do with
+  // the transform, and it means a ratio against it understates the gap in GPU
+  // work. Say so rather than letting the headline ratio be read as compute.
+  const LAUNCH_BOUND = 0.5;
+  for (const r of good) {
+    const share = (r.json.throughput.encodeMsPerStep ?? 0) / rate(r);
+    if (share > LAUNCH_BOUND) {
+      console.log(
+        `\n  NOTE  ${r.label} spends ${(100 * share).toFixed(0)}% of its time on the CPU queueing\n` +
+          `  work, so ${rate(r).toFixed(3)} ms is roughly what it costs to *submit* a round trip\n` +
+          `  here, not what the GPU spends on one — the real GPU time is below that and\n` +
+          `  this measurement cannot see it. Raise --lmax until the GPU dominates, or read\n` +
+          `  any ratio involving this row as a lower bound on the difference in GPU work.`,
+      );
+    }
+  }
   if (cuda && wg) {
     const ratio = rate(cuda) / rate(wg);
     console.log(
