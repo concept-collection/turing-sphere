@@ -23,6 +23,8 @@ export interface LegParams {
   nlat: number;
   wgSynth: number; // workgroup size for synthesis (threads over latitude)
   wgAnalys: number; // workgroup size for analysis (power of two)
+  /** Use subgroup reductions in the analysis kernel (needs the `subgroups` feature). */
+  subgroups?: boolean;
 }
 
 const BINDINGS = /* wgsl */ `
@@ -106,7 +108,14 @@ fn leg_synth(@builtin(global_invocation_id) gid: vec3u,
 
 export function legAnalysWGSL(p: LegParams): string {
   const K = Math.ceil(p.nlat / p.wgAnalys); // latitudes per thread
-  return /* wgsl */ `
+  // With subgroups, the per-l-pair reduction is one subgroupAdd plus a combine
+  // across subgroups: 2 barriers instead of 1 + log2(wgAnalys). This is what
+  // SHTNS's CUDA kernel does with warp shuffles. `red` then holds one partial
+  // per subgroup; WebGPU guarantees subgroup size >= 4, so wgAnalys/4 is a safe
+  // upper bound on how many there can be.
+  const sg = p.subgroups === true;
+  const redLen = sg ? Math.max(1, p.wgAnalys / 4) : p.wgAnalys;
+  return /* wgsl */ `${sg ? 'enable subgroups;\n' : ''}
 ${RESCALE_WGSL}
 const LMAX: u32 = ${p.lmax}u;
 const NLAT: u32 = ${p.nlat}u;
@@ -116,11 +125,15 @@ ${BINDINGS}
 @group(0) @binding(3) var<storage, read> fm: array<vec2f>;        // [(m)*NLAT + ilat]
 @group(0) @binding(4) var<storage, read_write> qout: array<vec2f>;
 
-var<workgroup> red: array<vec4f, ${p.wgAnalys}>;
+var<workgroup> red: array<vec4f, ${redLen}>;
 
 @compute @workgroup_size(${p.wgAnalys})
 fn leg_analys(@builtin(local_invocation_id) lid3: vec3u,
-              @builtin(workgroup_id) wid: vec3u) {
+              @builtin(workgroup_id) wid: vec3u${
+                sg
+                  ? ',\n              @builtin(subgroup_size) sgSize: u32,\n              @builtin(subgroup_invocation_id) sgLane: u32'
+                  : ''
+              }) {
   let lid = lid3.x;
   let m = wid.x;
   let base = m * (LMAX + 1u) - (m * (m - 1u)) / 2u;
@@ -167,7 +180,25 @@ fn leg_analys(@builtin(local_invocation_id) lid3: vec3u,
         y1v[k] *= INV_SCALE;
       }
     }
-    // workgroup tree reduction of (c0, c1)
+${
+    sg
+      ? `    // Reduce (c0, c1) across the workgroup: one subgroupAdd, then combine the
+    // per-subgroup partials. Two barriers per l-pair rather than 1 + log2(WG),
+    // and no half-idle tree. Both barriers sit in uniform control flow.
+    let part = subgroupAdd(vec4f(c0, c1));
+    if (sgLane == 0u) { red[lid / sgSize] = part; }
+    workgroupBarrier();
+    if (lid == 0u) {
+      var tot = vec4f(0.0);
+      let nsub = (WG + sgSize - 1u) / sgSize;
+      for (var i = 0u; i < nsub; i++) { tot += red[i]; }
+      qout[base + (l - m)] = tot.xy;
+      if (l + 1u <= LMAX) {
+        qout[base + (l + 1u - m)] = tot.zw;
+      }
+    }
+    workgroupBarrier();   // red is reused next iteration`
+      : `    // workgroup tree reduction of (c0, c1)
     red[lid] = vec4f(c0, c1);
     workgroupBarrier();
     var s = WG / 2u;
@@ -181,7 +212,8 @@ fn leg_analys(@builtin(local_invocation_id) lid3: vec3u,
       if (l + 1u <= LMAX) {
         qout[base + (l + 1u - m)] = red[0].zw;
       }
-    }
+    }`
+  }
     if (l + 2u > LMAX) { break; }
     let a0 = ab[base + (l + 2u - m)];
     var a1 = vec2f(0.0);

@@ -35,7 +35,56 @@ export interface ShtOptions {
 }
 
 const WG_SYNTH = 64;
-const WG_ANALYS = 256;
+
+/**
+ * Tuning knob, for A/B-ing a change without editing code. Reads globalThis
+ * first (set it before creating a plan, as scripts/_ab.ts does), then the
+ * environment, so `SHT_SUBGROUPS=0 npm run bench:sht` works too. `process` is
+ * absent in the browser, where only the globalThis form applies.
+ */
+function tuning(name: string): unknown {
+  const g = (globalThis as Record<string, unknown>)[name];
+  if (g !== undefined) return g;
+  const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env?.[name];
+  if (env === undefined || env === '') return undefined;
+  if (env === '1' || env === 'true') return true;
+  if (env === '0' || env === 'false') return false;
+  const n = Number(env);
+  return Number.isFinite(n) ? n : env;
+}
+
+/**
+ * Workgroup size for the analysis Legendre reduction. The right answer differs
+ * between the two reduction strategies, so it is chosen per strategy.
+ *
+ * Measured on an RTX PRO 6000 Blackwell (analysis, us). Shared-memory tree,
+ * where each doubling of wgAnalys costs another barrier per l-pair:
+ *
+ *          wgAnalys:   16     32     64    128    256
+ *   nlat=128          43.2   40.6   42.6   46.7   52.9   -> 32
+ *   nlat=256         104.0   85.6   87.8   89.9  100.0   -> 32
+ *   nlat=512         408.8  216.9  184.4  190.8  204.8   -> 64
+ *
+ * i.e. max(32, nlat/8). A flat 32 would be worse than the old default of 256 at
+ * nlat=512, so it cannot be fitted on one grid. With subgroupAdd the barrier
+ * count stops growing with wgAnalys and the picture inverts: threads in flight,
+ * (mmax+1) * wgAnalys, becomes binding, since analysis dispatches only mmax+1
+ * workgroups. 128 then wins at every grid (round trip, us):
+ *
+ *   128x256  37.8 (vs 38.3),  256x512  66.6 (vs 74.7),  512x1024  131.9 (vs 156.6)
+ */
+function defaultWgAnalys(nlat: number, limit: number, subgroups: boolean): number {
+  if (subgroups) {
+    // capped at nlat so small grids do not launch threads with no latitude to own
+    let cap = 1;
+    while (cap < nlat) cap *= 2;
+    return Math.min(128, limit, cap);
+  }
+  const target = Math.max(32, nlat / 8);
+  let wg = 1;
+  while (wg < target) wg *= 2; // the tree reduction halves, so a power of two
+  return Math.min(wg, limit);
+}
 
 async function makePipeline(
   device: GPUDevice,
@@ -170,7 +219,18 @@ export class ShtPlan {
     dev.queue.writeBuffer(this.bufTrig, 0, trig);
 
     // --- shaders / pipelines ---
-    const legP = { lmax, mmax, nlat, wgSynth: WG_SYNTH, wgAnalys: WG_ANALYS };
+    const subgroups = tuning('SHT_SUBGROUPS') !== false && dev.features.has('subgroups');
+    const wgAnalys =
+      (tuning('SHT_WG_ANALYS') as number | undefined) ??
+      defaultWgAnalys(nlat, dev.limits.maxComputeInvocationsPerWorkgroup, subgroups);
+    const legP = {
+      lmax,
+      mmax,
+      nlat,
+      wgSynth: WG_SYNTH,
+      wgAnalys,
+      subgroups,
+    };
     const fourP = { mmax, nlat, nphi };
     const [pLegS, pLegA, pFourS, pFourA] = await Promise.all([
       makePipeline(dev, legSynthWGSL(legP), 'leg_synth'),
@@ -359,7 +419,12 @@ export async function requestShtDevice(): Promise<GPUDevice> {
   if (!adapter) throw new Error('No WebGPU adapter available');
   // ask for a larger workgroup storage if the adapter offers it (bigger FFTs)
   const wgStorage = Math.min(adapter.limits.maxComputeWorkgroupStorageSize, 32768);
+  // `subgroups` lets the analysis reduction use subgroupAdd instead of a
+  // shared-memory tree (2 barriers per l-pair instead of 1 + log2(wgAnalys)).
+  // Optional: ShtPlan falls back to the tree when it is not available.
+  const features: GPUFeatureName[] = adapter.features.has('subgroups') ? ['subgroups'] : [];
   return adapter.requestDevice({
+    requiredFeatures: features,
     requiredLimits: { maxComputeWorkgroupStorageSize: wgStorage },
   });
 }
