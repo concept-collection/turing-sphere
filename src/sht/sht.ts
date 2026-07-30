@@ -115,6 +115,8 @@ export class ShtPlan {
   readonly cfg: ShtConfig;
   readonly nlm: number;
   readonly fourierMode: 'fft' | 'dft';
+  /** Latitudes leg_synth walks: nlat/2 when parity folding. */
+  readonly legLat: number = 0;
   /** Colatitudes theta_i (f64, increasing: north to south). */
   readonly theta: Float64Array;
   readonly cosTheta: Float64Array;
@@ -220,6 +222,8 @@ export class ShtPlan {
 
     // --- shaders / pipelines ---
     const subgroups = tuning('SHT_SUBGROUPS') !== false && dev.features.has('subgroups');
+    // parity folding needs an equator-symmetric grid; Gauss nodes are, if nlat is even
+    const parity = tuning('SHT_PARITY') !== false && nlat % 2 === 0;
     const wgAnalys =
       (tuning('SHT_WG_ANALYS') as number | undefined) ??
       defaultWgAnalys(nlat, dev.limits.maxComputeInvocationsPerWorkgroup, subgroups);
@@ -231,7 +235,9 @@ export class ShtPlan {
       wgAnalys,
       subgroups,
       spanPairs: tuning('SHT_SPAN_PAIRS') as number | undefined,
+      parity,
     };
+    (this as { legLat: number }).legLat = parity ? nlat / 2 : nlat;
     const fourP = { mmax, nlat, nphi };
     const [pLegS, pLegA, pFourS, pFourA] = await Promise.all([
       makePipeline(dev, legSynthWGSL(legP), 'leg_synth'),
@@ -310,7 +316,7 @@ export class ShtPlan {
     const { mmax, nlat, nphi } = this.cfg;
     pass.setPipeline(this.pipeLegSynth);
     pass.setBindGroup(0, b.bgLeg);
-    pass.dispatchWorkgroups(Math.ceil(nlat / WG_SYNTH), mmax + 1);
+    pass.dispatchWorkgroups(Math.ceil(this.legLat / WG_SYNTH), mmax + 1);
     pass.setPipeline(this.pipeFourSynth);
     pass.setBindGroup(0, b.bgFour);
     if (this.fourierMode === 'fft') {

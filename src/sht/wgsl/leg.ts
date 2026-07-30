@@ -27,6 +27,11 @@ export interface LegParams {
   subgroups?: boolean;
   /** l-pairs accumulated before the span is reduced (subgroup path only). */
   spanPairs?: number;
+  /**
+   * Fold north/south latitude pairs onto one recurrence (halves Legendre work).
+   * Needs an equator-symmetric grid with even nlat, which the Gauss grid is.
+   */
+  parity?: boolean;
 }
 
 const BINDINGS = /* wgsl */ `
@@ -36,10 +41,12 @@ const BINDINGS = /* wgsl */ `
 `;
 
 export function legSynthWGSL(p: LegParams): string {
+  const half = p.parity === true;
   return /* wgsl */ `
 ${RESCALE_WGSL}
 const LMAX: u32 = ${p.lmax}u;
 const NLAT: u32 = ${p.nlat}u;
+const NLAT_2: u32 = ${p.nlat / 2}u;
 ${BINDINGS}
 @group(0) @binding(3) var<storage, read> qlm: array<vec2f>;
 @group(0) @binding(4) var<storage, read_write> fm: array<vec2f>;  // [(m)*NLAT + ilat]
@@ -49,7 +56,7 @@ fn leg_synth(@builtin(global_invocation_id) gid: vec3u,
              @builtin(workgroup_id) wid: vec3u) {
   let ilat = gid.x;
   let m = wid.y;
-  if (ilat >= NLAT) { return; }
+  if (ilat >= ${half ? 'NLAT_2' : 'NLAT'}) { return; }
 
   let ct = ctstw[ilat];
   let st = ctstw[NLAT + ilat];
@@ -63,14 +70,30 @@ fn leg_synth(@builtin(global_invocation_id) gid: vec3u,
     y1 = ab[base + 1u].x * ct * y0;
   }
 
-  var acc = vec2f(0.0);
+${
+    half
+      ? `  // Parity folding: ytilde_l^m(-x) = (-1)^(l-m) ytilde_l^m(x) and the Gauss
+  // grid is symmetric, so one recurrence serves a north/south pair. y0 always
+  // carries even (l-m) and y1 odd, so summing them apart gives
+  //   F_m(north) = accE + accO,  F_m(south) = accE - accO.
+  var accE = vec2f(0.0);
+  var accO = vec2f(0.0);`
+      : `  var acc = vec2f(0.0);`
+  }
   var l = m;
   loop {
     if (ny == 0) {
-      acc += y0 * qlm[base + (l - m)];
+${
+    half
+      ? `      accE += y0 * qlm[base + (l - m)];
+      if (l + 1u <= LMAX) {
+        accO += y1 * qlm[base + (l + 1u - m)];
+      }`
+      : `      acc += y0 * qlm[base + (l - m)];
       if (l + 1u <= LMAX) {
         acc += y1 * qlm[base + (l + 1u - m)];
-      }
+      }`
+  }
     } else if (abs(y0) > RESCALE_THR) {
       ny += 1;
       y0 *= INV_SCALE;
@@ -103,13 +126,20 @@ fn leg_synth(@builtin(global_invocation_id) gid: vec3u,
     y0 = t0;
     l += 2u;
   }
-  fm[m * NLAT + ilat] = acc;
+${
+    half
+      ? `  fm[m * NLAT + ilat] = accE + accO;
+  fm[m * NLAT + (NLAT - 1u - ilat)] = accE - accO;`
+      : `  fm[m * NLAT + ilat] = acc;`
+  }
 }
 `;
 }
 
 export function legAnalysWGSL(p: LegParams): string {
-  const K = Math.ceil(p.nlat / p.wgAnalys); // latitudes per thread
+  const half = p.parity === true;
+  // parity folding leaves only the northern half of the grid to walk
+  const K = Math.ceil((half ? p.nlat / 2 : p.nlat) / p.wgAnalys);
   // With subgroups, the per-l-pair reduction is one subgroupAdd plus a combine
   // across subgroups: 2 barriers instead of 1 + log2(wgAnalys). This is what
   // SHTNS's CUDA kernel does with warp shuffles. `red` then holds one partial
@@ -135,6 +165,7 @@ const LMAX: u32 = ${p.lmax}u;
 const NLAT: u32 = ${p.nlat}u;
 const WG: u32 = ${p.wgAnalys}u;
 const K: u32 = ${K}u;
+const NLAT_2: u32 = ${p.nlat / 2}u;
 const PAIRS: u32 = ${pairs}u;
 ${BINDINGS}
 @group(0) @binding(3) var<storage, read> fm: array<vec2f>;        // [(m)*NLAT + ilat]
@@ -158,18 +189,41 @@ fn leg_analys(@builtin(local_invocation_id) lid3: vec3u,
   var y1v: array<f32, ${K}>;
   var nyv: array<i32, ${K}>;
   var ctv: array<f32, ${K}>;
-  var wfv: array<vec2f, ${K}>;
+${
+    half
+      ? `  // Transpose of the synthesis folding: splitting the latitude sum into
+  // hemispheres gives Q_lm = sum_north w_i * ytilde * (G_north +/- G_south),
+  // with + for even (l-m) and - for odd -- which the loop already routes
+  // through y0 and y1 respectively.
+  var wpv: array<vec2f, ${K}>;
+  var wmv: array<vec2f, ${K}>;`
+      : `  var wfv: array<vec2f, ${K}>;`
+  }
 
   for (var k = 0u; k < K; k++) {
     let lat = lid + k * WG;
     var ct: f32 = 0.0;
     var st: f32 = 0.0;
-    var wf = vec2f(0.0);
+${
+    half
+      ? `    var wp = vec2f(0.0);
+    var wm = vec2f(0.0);
+    if (lat < NLAT_2) {
+      ct = ctstw[lat];
+      st = ctstw[NLAT + lat];
+      let w = ctstw[2u * NLAT + lat];                    // Gauss weight (incl. 2*pi/nphi)
+      let gN = fm[m * NLAT + lat];
+      let gS = fm[m * NLAT + (NLAT - 1u - lat)];
+      wp = (gN + gS) * w;
+      wm = (gN - gS) * w;
+    }`
+      : `    var wf = vec2f(0.0);
     if (lat < NLAT) {
       ct = ctstw[lat];
       st = ctstw[NLAT + lat];
       wf = fm[m * NLAT + lat] * ctstw[2u * NLAT + lat];  // Gauss weight (incl. 2*pi/nphi)
-    }
+    }`
+  }
     ctv[k] = ct;
     let seed = sinpow_rescaled(st, m);
     y0v[k] = seed.y0 * amm[m];
@@ -178,7 +232,7 @@ fn leg_analys(@builtin(local_invocation_id) lid3: vec3u,
     if (m < LMAX) {
       y1v[k] = ab[base + 1u].x * ct * y0v[k];
     }
-    wfv[k] = wf;
+${half ? '    wpv[k] = wp;\n    wmv[k] = wm;' : '    wfv[k] = wf;'}
   }
 
   var l = m;
@@ -196,8 +250,13 @@ ${
       var c1 = vec2f(0.0);
       for (var k = 0u; k < K; k++) {
         if (nyv[k] == 0) {
-          c0 += wfv[k] * y0v[k];
-          c1 += wfv[k] * y1v[k];
+${
+      half
+        ? `          c0 += wpv[k] * y0v[k];   // even (l-m): hemispheres add
+          c1 += wmv[k] * y1v[k];   // odd  (l-m): hemispheres subtract`
+        : `          c0 += wfv[k] * y0v[k];
+          c1 += wfv[k] * y1v[k];`
+    }
         } else if (abs(y0v[k]) > RESCALE_THR) {
           nyv[k] += 1;
           y0v[k] *= INV_SCALE;
