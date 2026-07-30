@@ -107,6 +107,21 @@ export class SphereScene {
     this.#needsRender = true;
   }
 
+  /** The renderer's canvas, for capturing frames. */
+  get canvas(): HTMLCanvasElement {
+    return this.#renderer.domElement;
+  }
+
+  /**
+   * Render immediately, outside the animation loop. A WebGL canvas without
+   * preserveDrawingBuffer keeps its drawing buffer only until the browser next
+   * composites, so a capturer must render and copy within one task.
+   */
+  renderNow(): void {
+    this.#needsRender = false;
+    this.#renderer.render(this.#scene, this.#camera);
+  }
+
   /** Mirror this scene's camera whenever the other scene's controls move. */
   syncCamerasWith(other: SphereScene): void {
     const follow = (src: SphereScene, dst: SphereScene) => {
@@ -124,6 +139,16 @@ export class SphereScene {
     };
     follow(this, other);
     follow(other, this);
+  }
+
+  /** Orbit the camera about the up axis by `angle` radians, keeping the
+   *  target. Synced sibling scenes follow via their controls, as with a drag. */
+  orbitBy(angle: number): void {
+    const offset = this.#camera.position.clone().sub(this.#controls.target);
+    offset.applyAxisAngle(this.#camera.up, angle);
+    this.#camera.position.copy(this.#controls.target).add(offset);
+    this.#controls.update();
+    this.#needsRender = true;
   }
 
   /** Camera pose, for carrying the view across a scene rebuild. */

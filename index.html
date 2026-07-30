@@ -49,6 +49,8 @@
         display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center;
         padding: 6px 0;
       }
+      /* display:flex above would otherwise override the UA's [hidden] rule */
+      .controls[hidden] { display: none; }
       .controls label { color: var(--ink-2); font-size: 13px; white-space: nowrap; }
       select, input[type="number"], button {
         font: inherit; font-size: 13px;
@@ -195,6 +197,24 @@
         <button id="benchmark">Benchmark</button>
         <button id="reseed">Re-seed</button>
         <button id="resetview">Reset view</button>
+        <button id="movietoggle" title="Export the run as an MP4 movie">Export movie</button>
+      </div>
+      <div class="controls" id="moviebar" hidden>
+        <label title="Playback speed: simulation-time units per second of video — 1× plays one time unit per second">movie speed
+          <select id="moviespeed">
+            <option value="0.1">0.1×</option>
+            <option value="0.5">0.5×</option>
+            <option value="1">1×</option>
+            <option value="3">3×</option>
+            <option value="5">5×</option>
+            <option value="10" selected>10×</option>
+            <option value="20">20×</option>
+          </select>
+        </label>
+        <label title="Slowly orbit the camera during the movie — one revolution per 2 minutes of video, starting from the current view (which is restored afterwards)">
+          <input type="checkbox" id="movierotate" checked /> auto-rotate
+        </label>
+        <button id="movie" title="Recompute the run from t = 0 and download it as an MP4 movie">Export</button>
       </div>
       <div class="controls" id="params"></div>
       <div id="panels"></div>

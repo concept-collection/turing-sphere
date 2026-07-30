@@ -18,6 +18,7 @@
     "bench:native": "node scripts/compare-native.mjs"
   },
   "dependencies": {
+    "mp4-muxer": "^5.2.2",
     "numbl": "file:../../numbl",
     "three": "^0.183.0"
   },
